@@ -1,0 +1,20 @@
+{application, nhttpc, [
+    {description,
+        "High-performance HTTP/1.1, HTTP/2, HTTP/3 and WebSocket client for Erlang/OTP 27+"},
+    {vsn, "1.0.0"},
+    {registered, []},
+    {applications, [
+        kernel,
+        stdlib,
+        ssl,
+        nhttp_lib,
+        nquic,
+        opentelemetry_api,
+        opentelemetry_api_experimental,
+        telemetry
+    ]},
+    {env, []},
+    {modules, []},
+    {licenses, ["Apache-2.0"]},
+    {links, [{"GitHub", "https://github.com/nomasystems/nhttpc"}]}
+]}.

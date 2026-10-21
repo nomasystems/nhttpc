@@ -1,0 +1,41 @@
+# Rebar3 build artifacts
+_build/
+_checkouts/
+
+# Erlang artifacts
+*.beam
+*.plt
+erl_crash.dump
+.eunit/
+.rebar3/
+
+# Common Test logs
+logs/
+log/
+ct_logs/
+
+# Cover data
+*.coverdata
+cover/
+
+# Editor/IDE
+*.swp
+*.swo
+*~
+.idea/
+*.iml
+.vscode/
+.elixir_ls/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Nix/direnv
+.direnv/
+result
+result-*
+
+# Temporary files
+*.tmp
+*.temp
