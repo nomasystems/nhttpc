@@ -71,6 +71,7 @@
     normalize_method_options/1,
     normalize_method_trace/1,
     normalize_method_patch/1,
+    normalize_method_query/1,
     normalize_method_custom/1
 ]).
 
@@ -155,6 +156,7 @@ groups() ->
             normalize_method_options,
             normalize_method_trace,
             normalize_method_patch,
+            normalize_method_query,
             normalize_method_custom
         ]},
         {url_info, [sequence], [
@@ -527,6 +529,11 @@ normalize_method_trace(_Config) ->
 normalize_method_patch(_Config) ->
     ?assertEqual(patch, nhttpc_url:normalize_method(patch)),
     ?assertEqual(patch, nhttpc_url:normalize_method(<<"PATCH">>)),
+    ok.
+
+normalize_method_query(_Config) ->
+    ?assertEqual(query, nhttpc_url:normalize_method(query)),
+    ?assertEqual(query, nhttpc_url:normalize_method(<<"QUERY">>)),
     ok.
 
 normalize_method_custom(_Config) ->

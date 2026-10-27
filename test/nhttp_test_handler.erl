@@ -207,6 +207,19 @@ handle_request(#{method := post, path := <<"/redirect-301-post", _/binary>>}, St
         body => <<"Moved Permanently">>
     },
     {reply, Resp, State};
+%% QUERY /redirect-query/{301,302} - 301 or 302 for QUERY (preserved, RFC 10008)
+handle_request(
+    #{method := query, path := <<"/redirect-query/", Status:3/binary, _/binary>>}, State
+) ->
+    Resp = #{
+        status => binary_to_integer(Status),
+        headers => [
+            {<<"location">>, <<"/check-method">>},
+            {<<"content-type">>, <<"text/plain">>}
+        ],
+        body => <<"Redirect">>
+    },
+    {reply, Resp, State};
 %% HEAD /redirect-301-head - 301 for HEAD (preserved)
 handle_request(#{method := head, path := <<"/redirect-301-head", _/binary>>}, State) ->
     Resp = #{

@@ -286,16 +286,12 @@ default_retry_conditions(Method) ->
 
 -doc """
 Whether the HTTP method is safe to retry without changing observable
-server state more than once. Idempotency follows RFC 9110 §9.2.2.
+server state more than once. Idempotency follows RFC 9110 §9.2.2 and
+RFC 10008 Section 2.
 """.
 -spec is_idempotent_method(nhttp_lib:method() | undefined) -> boolean().
-is_idempotent_method(get) -> true;
-is_idempotent_method(head) -> true;
-is_idempotent_method(put) -> true;
-is_idempotent_method(delete) -> true;
-is_idempotent_method(options) -> true;
-is_idempotent_method(trace) -> true;
-is_idempotent_method(_) -> false.
+is_idempotent_method(undefined) -> false;
+is_idempotent_method(Method) -> nhttp_lib:is_idempotent(Method).
 
 -doc "Add jitter to delay (+/- 25%).".
 -spec maybe_add_jitter(non_neg_integer(), boolean()) -> non_neg_integer().

@@ -450,7 +450,7 @@ retry_auto_respects_idempotency(_Config) ->
 is_idempotent_method_each(_Config) ->
     [
         ?assert(nhttpc_retry:is_idempotent_method(M))
-     || M <- [get, head, put, delete, options, trace]
+     || M <- [get, head, put, delete, options, trace, query]
     ],
     [?assertNot(nhttpc_retry:is_idempotent_method(M)) || M <- [post, patch, connect]],
     ok.

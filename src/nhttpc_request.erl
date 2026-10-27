@@ -241,7 +241,8 @@ add_host_value(Headers, Host, Port, Transport) ->
 Adjust request for redirect based on status code.
 RFC 9110 Section 15.4:
 
-- 301/302: Method may change to GET (historically)
+- 301/302: Method may change to GET (historically), except GET, HEAD and
+  QUERY (RFC 10008 Section 2.5)
 - 303: Always changes to GET
 - 307/308: Method and body preserved
 """.
@@ -259,6 +260,8 @@ adjust_request_for_redirect(#{method := Method} = Req, Status, OldUrlInfo, NewUr
                 get ->
                     update_request_path(Req1, NewUrlInfo);
                 head ->
+                    update_request_path(Req1, NewUrlInfo);
+                query ->
                     update_request_path(Req1, NewUrlInfo);
                 _ ->
                     Req2 = Req1#{method => get, body => <<>>},

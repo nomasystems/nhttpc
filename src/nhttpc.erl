@@ -443,6 +443,10 @@ at-least-once delivery on a `POST` must list the conditions or supply a
 `max_redirects` cap defaults to 5. `redirect_policy => fun/4` lets you
 inspect each hop and either continue, stop, or supply updated opts.
 
+A 303 changes the method to `GET`. A 301 or a 302 changes every method
+except `GET`, `HEAD` and `QUERY` to `GET`. A 307 or a 308 keeps the
+method and the body.
+
 Cross-origin hops strip `Authorization`, `Cookie`, and other
 credential-bearing headers by default.
 
