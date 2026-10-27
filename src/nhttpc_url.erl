@@ -115,16 +115,8 @@ normalize_method(connect) -> connect;
 normalize_method(options) -> options;
 normalize_method(trace) -> trace;
 normalize_method(patch) -> patch;
-normalize_method(<<"GET">>) -> get;
-normalize_method(<<"HEAD">>) -> head;
-normalize_method(<<"POST">>) -> post;
-normalize_method(<<"PUT">>) -> put;
-normalize_method(<<"DELETE">>) -> delete;
-normalize_method(<<"CONNECT">>) -> connect;
-normalize_method(<<"OPTIONS">>) -> options;
-normalize_method(<<"TRACE">>) -> trace;
-normalize_method(<<"PATCH">>) -> patch;
-normalize_method(Method) when is_binary(Method) -> Method.
+normalize_method(query) -> query;
+normalize_method(Method) when is_binary(Method) -> nhttp_lib:decode_method(Method).
 
 -spec partial_url_info(binary()) -> http_url_info().
 partial_url_info(Path) ->

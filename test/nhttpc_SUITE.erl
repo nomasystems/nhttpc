@@ -108,6 +108,9 @@
     redirect_absolute_url/1,
     redirect_post_301_becomes_get/1,
     redirect_head_301_preserved/1,
+    redirect_query_301_preserved/1,
+    redirect_query_302_preserved/1,
+    redirect_query_303_becomes_get/1,
     redirect_cross_origin_strips_auth/1,
     redirect_relative_with_dotdot/1,
     redirect_with_query_string/1
@@ -283,6 +286,9 @@ groups() ->
             redirect_absolute_url,
             redirect_post_301_becomes_get,
             redirect_head_301_preserved,
+            redirect_query_301_preserved,
+            redirect_query_302_preserved,
+            redirect_query_303_becomes_get,
             redirect_cross_origin_strips_auth,
             redirect_relative_with_dotdot,
             redirect_with_query_string
@@ -1825,6 +1831,27 @@ redirect_head_301_preserved(Config) ->
     ?assertEqual(200, maps:get(status, Resp)),
     ok.
 
+%% Test QUERY with 301 keeps the method and the body (RFC 10008 Section 2.5)
+redirect_query_301_preserved(Config) ->
+    {ok, Resp} = nhttpc:request(query_request(Config, <<"/redirect-query/301">>, <<"q=301">>)),
+    ?assertEqual(200, maps:get(status, Resp)),
+    ?assertEqual(<<"Method: QUERY\nBody: q=301">>, maps:get(body, Resp, <<>>)),
+    ok.
+
+%% Test QUERY with 302 keeps the method and the body (RFC 10008 Section 2.5)
+redirect_query_302_preserved(Config) ->
+    {ok, Resp} = nhttpc:request(query_request(Config, <<"/redirect-query/302">>, <<"q=302">>)),
+    ?assertEqual(200, maps:get(status, Resp)),
+    ?assertEqual(<<"Method: QUERY\nBody: q=302">>, maps:get(body, Resp, <<>>)),
+    ok.
+
+%% Test QUERY with 303 becomes GET (RFC 10008 Section 2.5)
+redirect_query_303_becomes_get(Config) ->
+    {ok, Resp} = nhttpc:request(query_request(Config, <<"/redirect-303">>, <<"q=303">>)),
+    ?assertEqual(200, maps:get(status, Resp)),
+    ?assertEqual(<<"Final destination reached">>, maps:get(body, Resp, <<>>)),
+    ok.
+
 %% Test cross-origin redirect strips Authorization header
 redirect_cross_origin_strips_auth(Config) ->
     Port = proplists:get_value(server_port, Config),
@@ -2415,6 +2442,17 @@ make_list_iterator([]) ->
     fun() -> fin end;
 make_list_iterator([Chunk | Rest]) ->
     fun() -> {ok, Chunk, make_list_iterator(Rest)} end.
+
+%% Build a QUERY request with a form body to the test server
+-spec query_request([{atom(), term()}], binary(), binary()) -> nhttp_lib:request().
+query_request(Config, Path, Body) ->
+    Port = proplists:get_value(server_port, Config),
+    Url = iolist_to_binary([<<"http://127.0.0.1:">>, integer_to_binary(Port), Path]),
+    {ok, Req} = nhttpc:url(query, Url),
+    Req#{
+        headers => [{<<"content-type">>, <<"application/x-www-form-urlencoded">>}],
+        body => Body
+    }.
 
 %% Start an HTTP/2 TLS server for testing
 -spec start_h2_tls_server([{atom(), term()}]) -> [{atom(), term()}].

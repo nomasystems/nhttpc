@@ -5,6 +5,24 @@ All notable changes to nhttpc will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- The QUERY method (RFC 10008) on HTTP/1.1, HTTP/2 and HTTP/3.
+  `nhttpc:url/2` and `nhttpc:request/1,2` accept `query` and
+  `<<"QUERY">>`. A retry treats QUERY as idempotent. A 301 or a 302
+  redirect keeps the QUERY method and the body.
+
+### Changed
+
+- Require `nhttp_lib` 2.1.0 and `nquic` 1.2.0. The HTTP/2 codec checks
+  the connection preface of the server (RFC 9113 Section 3.4) and keeps
+  the HPACK state after a malformed field section. An HTTP/3 connection
+  completes the handshake after the loss of the server Initial or the
+  client Finished. Loss detection and congestion control conform to
+  RFC 9002 and RFC 9438.
+
 ## [1.0.0] - 2026-10-21
 
 Initial public release.
