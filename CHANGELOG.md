@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-10-28
+
+### Changed
+
+- Require `nhttp_lib` 2.1.1. The nhttpc API and its behavior do not
+  change.
+
 ## [1.1.0] - 2026-10-27
 
 ### Added

@@ -1,7 +1,7 @@
 {application, nhttpc, [
     {description,
         "High-performance HTTP/1.1, HTTP/2, HTTP/3 and WebSocket client for Erlang/OTP 27+"},
-    {vsn, "1.1.0"},
+    {vsn, "1.1.1"},
     {registered, []},
     {applications, [
         kernel,
