@@ -43,7 +43,9 @@ This module handles:
     body_timeout => timeout(),
     max_response_size => pos_integer() | infinity,
     max_header_size => pos_integer() | infinity,
-    max_headers_count => pos_integer() | infinity
+    max_headers_count => pos_integer() | infinity,
+    tls => nhttpc:tls_opts(),
+    versions => [nhttp_lib:version()]
 }.
 
 -type on_headers_callback() ::
@@ -120,7 +122,7 @@ do_stream_request(Req, UrlInfo, StreamOpts) ->
     ConnectOpts = nhttpc_request:build_connect_opts(Transport, StreamOpts),
     case nhttp_sock:connect(Host, Port, ConnectOpts, ConnectTimeout) of
         {ok, Socket} ->
-            Protocol = nhttpc_request:detect_protocol(Socket),
+            Protocol = nhttpc_request:detect_protocol(Socket, nhttpc_opts:versions(StreamOpts)),
             ReqWithHost = nhttpc_request:add_host_header(Req, Host, Port, Transport),
             ReqWithEncoding = nhttpc_request:maybe_add_accept_encoding(ReqWithHost, #{}),
             Result = do_stream_on_connection(
@@ -475,7 +477,7 @@ continue_h2_stream(nofin, Rest, Stream) ->
 do_h2_stream_request(Socket, Req, StreamOpts, Timeout, BodyTimeout) ->
     H2Conn0 = nhttp_h2:new(client, nhttpc_h2:codec_settings()),
     Preface = nhttp_h2:preface(H2Conn0),
-    Headers = nhttpc_h2:request_to_h2_headers(Req),
+    Headers = nhttpc_h2:request_to_h2_headers(Req, h2_scheme(Req), h2_authority(Req)),
     Body = maps:get(body, Req, <<>>),
     EndStream =
         case iolist_size(Body) of
@@ -504,6 +506,15 @@ do_h2_stream_request(Socket, Req, StreamOpts, Timeout, BodyTimeout) ->
         },
         process_h2_stream_events(Events, Stream)
     end.
+
+-spec h2_authority(nhttp_lib:request()) -> binary().
+h2_authority(#{headers := Headers}) ->
+    proplists:get_value(<<"host">>, Headers, <<>>).
+
+-doc "The `:scheme` of the request: the scheme of its URL, and `https` without one.".
+-spec h2_scheme(nhttp_lib:request()) -> binary().
+h2_scheme(#{scheme := http}) -> <<"http">>;
+h2_scheme(_Req) -> <<"https">>.
 
 -spec process_h2_stream_events([nhttp_h2:event()], #h2_stream{}) ->
     {ok, term()} | {error, nhttpc_error:any_reason()}.

@@ -515,7 +515,7 @@ connecting_loop(
     receive
         {connect_result, {ok, Socket}} ->
             Data1 = clear_connector_mref(Data),
-            Protocol = detect_protocol(Socket, Data1#conn_data.protocols),
+            Protocol = nhttpc_request:detect_protocol(Socket, Data1#conn_data.protocols),
             Data2 = Data1#conn_data{socket = Socket, protocol = Protocol},
             complete_connection(Data2);
         {connect_result, {error, Reason}} ->
@@ -2423,27 +2423,6 @@ build_connect_opts(Opts) ->
         ]
     ),
     apply_tls_defaults(Transport, OptsWithUser).
-
--spec detect_protocol(nhttp_sock:t(), [nhttp_lib:version()]) -> nhttp_lib:version().
-detect_protocol(Socket, AllowedProtocols) ->
-    case nhttp_sock:negotiated_protocol(Socket) of
-        {ok, <<"h2">>} ->
-            case lists:member(http2, AllowedProtocols) of
-                true -> http2;
-                false -> http1_1
-            end;
-        {ok, <<"http/1.1">>} ->
-            http1_1;
-        {ok, <<"http/1.0">>} ->
-            http1_1;
-        {error, no_alpn} ->
-            case lists:member(http1_1, AllowedProtocols) of
-                true -> http1_1;
-                false -> http2
-            end;
-        _ ->
-            http1_1
-    end.
 
 -spec normalize_host(binary() | string() | inet:ip_address()) -> binary().
 normalize_host(Host) when is_binary(Host) -> Host;
