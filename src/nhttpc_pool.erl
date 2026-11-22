@@ -218,6 +218,7 @@ touching the manager.
     request/4,
     resolve/1,
     start_link/3,
+    stream/4,
     target/1,
     update_max_streams/3,
     wait_ready/2
@@ -552,6 +553,18 @@ resolve(Ref) ->
     {ok, pid()} | {error, nhttpc_error:any_reason()}.
 start_link(Ref, Tab, Opts) ->
     gen_server:start_link(?MODULE, {Ref, Tab, Opts}, []).
+
+-doc """
+Open one response stream on a pooled HTTP/2 connection, with the caller
+as its owner. A refused stream is re-dispatched as in `request/4`. The
+connection gives the slot back and tells the pool when the stream ends.
+""".
+-spec stream(pid() | term(), nhttp_lib:request(), timeout(), nhttpc_conn:send_opts()) ->
+    {ok, nhttpc:handle()} | {error, nhttpc:error()}.
+stream(PoolRef, Req, Timeout, SendOpts) ->
+    #{stream := StreamOpts} = SendOpts,
+    Pooled = SendOpts#{stream := StreamOpts#{pool => PoolRef}},
+    do_stream(PoolRef, Req, Timeout, Pooled, erlang:monotonic_time(millisecond), 0, undefined).
 
 -doc """
 Connection target (`scheme`, `host`, `port`) for the given pool
@@ -917,6 +930,43 @@ do_request(PoolRef, Req, Timeout, SendOpts, Start, Attempt, Exclude) ->
             end;
         {error, _} = Error ->
             Error
+    end.
+
+-spec do_stream(
+    pid() | term(),
+    nhttp_lib:request(),
+    timeout(),
+    nhttpc_conn:send_opts(),
+    integer(),
+    non_neg_integer(),
+    pid() | undefined
+) ->
+    {ok, nhttpc:handle()} | {error, nhttpc:error()}.
+do_stream(PoolRef, Req, Timeout, SendOpts, Start, Attempt, Exclude) ->
+    BodySize = nhttpc_h2:credit_claim(Req),
+    case acquire(PoolRef, remaining_timeout(Timeout, Start), Exclude, BodySize) of
+        {ok, ConnPid, Owner} ->
+            Remaining = remaining_timeout(Timeout, Start),
+            Result = nhttpc_conn:open_stream(ConnPid, Req, SendOpts, Remaining),
+            case nhttpc_error:wrap_result(Result) of
+                {ok, _Handle} = Opened ->
+                    Opened;
+                {error, {stream_error, {protocol, refused_stream}}} = Refused ->
+                    ok = release(Owner, ConnPid),
+                    case redispatch_allowed(Timeout, Start, Attempt) of
+                        true ->
+                            do_stream(
+                                PoolRef, Req, Timeout, SendOpts, Start, Attempt + 1, ConnPid
+                            );
+                        false ->
+                            Refused
+                    end;
+                {error, _} = Error ->
+                    ok = release(Owner, ConnPid),
+                    Error
+            end;
+        {error, _} = Error ->
+            nhttpc_error:wrap(Error)
     end.
 
 -spec grow_or_queue(gen_server:from(), timeout(), pid() | undefined, non_neg_integer(), #state{}) ->

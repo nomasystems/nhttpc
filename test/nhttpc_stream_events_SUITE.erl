@@ -253,11 +253,11 @@ stream_rejects_body_to(_Config) ->
 stream_rejects_non_oneshot_via(_Config) ->
     {ok, Req} = nhttpc:url(get, <<"http://127.0.0.1:1/echo">>),
     Result1 = nhttpc:stream(Req, #{via => {pool, some_pool}}),
-    ?assertEqual({error, {invalid_opts, stream_via_not_oneshot}}, Result1),
+    ?assertEqual({error, {connect_error, pool_not_found}}, Result1),
     Result2 = nhttpc:stream(Req, #{
         via => {conn, #{pid => self(), version => http1_1, peer => {{127, 0, 0, 1}, 1}}}
     }),
-    ?assertEqual({error, {invalid_opts, stream_via_not_oneshot}}, Result2),
+    ?assertEqual({error, {invalid_opts, stream_requires_http2}}, Result2),
     ok.
 
 %%%-----------------------------------------------------------------------------

@@ -269,7 +269,7 @@ stream_via_not_oneshot_returns_error(Config) ->
     Port = ?config(server_port, Config),
     {ok, Req} = nhttpc:url(get, url(Port, <<"/echo">>)),
     Result = nhttpc:stream(Req, #{via => {pool, fake}}),
-    ?assertEqual({error, {invalid_opts, stream_via_not_oneshot}}, Result),
+    ?assertEqual({error, {connect_error, pool_not_found}}, Result),
     ok.
 
 stream_with_body_to_returns_error(Config) ->

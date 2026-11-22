@@ -27,6 +27,7 @@ This module handles:
     get_content_encoding/1,
     get_header_value/2,
     h1_parse_opts/1,
+    is_streaming_body/1,
     maybe_add_accept_encoding/2,
 
     recv_h2_settings/3

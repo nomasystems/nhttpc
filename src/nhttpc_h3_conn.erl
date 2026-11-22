@@ -637,6 +637,10 @@ drain_sends(Acc, Remaining) ->
     reference(), nhttp_lib:request(), pid(), nhttpc_conn:send_opts(), #h3_data{}
 ) ->
     {ok, #h3_data{}} | {error, term(), #h3_data{}}.
+encode_h3_request_noflush(StreamRef, _Request, CallerPid, #{stream := _}, Data) ->
+    Reason = {invalid_opts, stream_requires_http2},
+    ok = reject_send(StreamRef, CallerPid, Reason, Data),
+    {error, Reason, Data};
 encode_h3_request_noflush(
     StreamRef,
     Request,

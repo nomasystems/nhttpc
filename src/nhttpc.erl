@@ -354,6 +354,10 @@ loop(H, Total) ->
     end.
 ```
 
+`stream/2` takes `via => {pool, Ref}` and `via => {conn, Conn}` on
+HTTP/2. The stream is then one HTTP/2 stream of that connection, and
+its credit is the stream window. See `stream/1`.
+
 ## Streaming uploads
 
 ```erlang
@@ -589,8 +593,9 @@ Attributes follow the OpenTelemetry HTTP client semantic conventions.
 ### Coverage
 
 `request/2` and `send/2` are instrumented. `stream/2` is instrumented
-on HTTP/3 only; the HTTP/1.1 and HTTP/2 streaming path goes through
-`nhttpc_stream_recv` and does not emit request events yet.
+on HTTP/3 only. A stream on HTTP/1.1 or HTTP/2, with any `via`, emits
+no request events. A stream on a pool emits the `[nhttpc, pool,
+checkout]` and `[nhttpc, pool, checkin]` events.
 
 ## Production notes
 
@@ -767,7 +772,7 @@ init([]) ->
 -type event() ::
     {response, nhttp_lib:response()}
     | {headers, nhttp_lib:status(), nhttp_lib:headers()}
-    | {data, binary(), nhttp_lib:fin()}
+    | {data, binary(), more | fin}
     | {trailers, nhttp_lib:headers()}
     | {pause, non_neg_integer()}
     | {resume, non_neg_integer()}
@@ -842,7 +847,7 @@ init([]) ->
     body_to => {file, file:filename()} | {fold, on_data_fun()},
     body_from => {file, file:filename()} | {iter, iterator()},
     fold_init => term(),
-    consume_initial => pos_integer() | infinity,
+    consume_initial => non_neg_integer() | infinity,
     consume_low_water => pos_integer(),
     via => via(),
     ws => map(),
@@ -985,7 +990,7 @@ HTTP/1.1 checkout is exclusive and ignores this option.
     cancelled
     | rst_stream
     | {flow_control, term()}
-    | {protocol, nhttp_lib:error()}
+    | {protocol, {h2, nhttp_lib:error_code()} | refused_stream | graceful | nhttp_lib:error()}
     | exceeded_max_response_size.
 
 -type body_reason() ::
@@ -1112,13 +1117,20 @@ Cancel an async request.
 The call blocks until the worker has torn down any in-flight request
 and acknowledged, then drains the caller's mailbox of
 `{nhttpc, Handle, _}` so the no-leak contract holds. Returns `ok`.
+A stream on a shared connection is reset with RST_STREAM and CANCEL.
 """.
 -spec cancel(handle()) -> ok.
 cancel(Handle) ->
-    case nhttpc_handle:kind(Handle) of
-        ws -> cancel_ws(Handle);
-        _ -> cancel_worker(Handle)
+    case {nhttpc_handle:kind(Handle), nhttpc_handle:is_shared(Handle)} of
+        {ws, _Shared} -> cancel_ws(Handle);
+        {_Kind, true} -> cancel_on_connection(Handle);
+        {_Kind, false} -> cancel_worker(Handle)
     end.
+
+-spec cancel_on_connection(handle()) -> ok.
+cancel_on_connection(Handle) ->
+    ok = nhttpc_conn:cancel_stream(nhttpc_handle:pid(Handle), nhttpc_handle:ref(Handle)),
+    flush(Handle).
 
 -spec cancel_worker(handle()) -> ok.
 cancel_worker(Handle) ->
@@ -1191,6 +1203,7 @@ after `consume/2` drops the buffer below `consume_low_water`, a
 `consume/2` is a no-op for non-streaming handles (`send/2`, `ws_open/2`),
 for already-finished streams, and for streams started with
 `consume_initial => infinity`.
+On a shared connection `consume/2` returns stream window credit to the peer.
 """.
 -spec consume(handle(), pos_integer()) -> ok.
 consume(Handle, N) when is_integer(N), N > 0 ->
@@ -1259,9 +1272,20 @@ the caller's mailbox:
 {nhttpc, Handle, {done, normal}}          %% terminal
 {nhttpc, Handle, {error, Reason}}         %% terminal
 ```
-Streaming is always one-shot for the duration of plan 07b — `via` other
-than the implicit `oneshot` is rejected, and `body_to` is not accepted
-because streaming downloads emit events instead of writing to a sink.
+`body_to` is not accepted.
+
+`via => {pool, Ref}` and `via => {conn, Conn}` open one HTTP/2 stream
+on a shared connection. Another protocol returns
+`{error, {invalid_opts, stream_requires_http2}}`. On that path:
+
+- `stream/2` returns when the stream is open.
+- The peer can send 65535 octets plus `consume_initial` ahead of what
+  `consume/2` returned. `consume_initial => infinity` removes the bound.
+  No `pause` and no `resume` event is sent.
+- `timeouts.request` bounds the whole stream. `infinity` is legal.
+- `cancel/1` and the exit of the owner reset the stream. The connection
+  stays open.
+- The body is not decompressed.
 """.
 -spec stream(nhttp_lib:request()) -> {ok, handle()} | {error, error()}.
 stream(Request) ->
@@ -1271,35 +1295,57 @@ stream(Request) ->
 -spec stream(nhttp_lib:request(), opts()) -> {ok, handle()} | {error, error()}.
 stream(Request, Opts) ->
     Result =
-        case validate_stream_opts(Opts) of
-            ok ->
-                case nhttpc_opts:normalize(Opts) of
-                    {ok, NormalizedOpts} ->
-                        case nhttpc_url:to_request(Request) of
-                            {ok, NormalizedReq, UrlInfo} ->
-                                {Req, ReqOpts} = apply_body_from(NormalizedReq, NormalizedOpts),
-                                nhttpc_stream_worker:start(self(), Req, UrlInfo, ReqOpts);
-                            {error, _} = Error ->
-                                Error
-                        end;
-                    {error, _} = Error ->
-                        Error
-                end;
-            {error, _} = Error ->
-                Error
+        maybe
+            ok ?= validate_stream_opts(Opts),
+            {ok, NormalizedOpts} ?= nhttpc_opts:normalize(Opts),
+            {ok, NormalizedReq, UrlInfo} ?= nhttpc_url:to_request(Request),
+            {Req, ReqOpts} = apply_body_from(NormalizedReq, NormalizedOpts),
+            start_stream(maps:get(via, ReqOpts, oneshot), Req, UrlInfo, ReqOpts)
         end,
     nhttpc_error:wrap_result(Result).
+
+-spec connection_stream_body(nhttp_lib:request()) -> ok | {error, error()}.
+connection_stream_body(Req) ->
+    case nhttpc_request:is_streaming_body(maps:get(body, Req, <<>>)) of
+        true -> nhttpc_error:invalid_request(stream_body_via_not_oneshot);
+        false -> ok
+    end.
+
+-spec start_stream(via(), nhttp_lib:request(), nhttpc_url:http_url_info(), opts()) ->
+    {ok, handle()} | {error, nhttpc_error:any_reason()}.
+start_stream(oneshot, Req, UrlInfo, Opts) ->
+    nhttpc_stream_worker:start(self(), Req, UrlInfo, Opts);
+start_stream({pool, PoolRef}, Req, _UrlInfo, Opts) ->
+    maybe
+        ok ?= connection_stream_body(Req),
+        nhttpc_pool:stream(
+            PoolRef, Req, nhttpc_opts:timeout(request, Opts), stream_send_opts(Opts)
+        )
+    end;
+start_stream({conn, #{pid := ConnPid, version := http2}}, Req, _UrlInfo, Opts) ->
+    maybe
+        ok ?= connection_stream_body(Req),
+        nhttpc_conn:open_stream(
+            ConnPid, Req, stream_send_opts(Opts), nhttpc_opts:timeout(request, Opts)
+        )
+    end;
+start_stream({conn, _Connection}, _Req, _UrlInfo, _Opts) ->
+    nhttpc_error:invalid_opts(stream_requires_http2).
+
+-spec stream_send_opts(opts()) -> nhttpc_conn:send_opts().
+stream_send_opts(Opts) ->
+    SendOpts = maps:with([max_response_size], Opts),
+    Stream = SendOpts#{stream => maps:with([consume_initial], Opts)},
+    case Opts of
+        #{timeouts := #{request := Timeout}} -> Stream#{request_timeout => Timeout};
+        #{} -> Stream
+    end.
 
 -spec validate_stream_opts(opts()) -> ok | {error, error()}.
 validate_stream_opts(Opts) ->
     case maps:is_key(body_to, Opts) of
-        true ->
-            nhttpc_error:invalid_opts(body_to_on_stream);
-        false ->
-            case maps:get(via, Opts, oneshot) of
-                oneshot -> ok;
-                _ -> nhttpc_error:invalid_opts(stream_via_not_oneshot)
-            end
+        true -> nhttpc_error:invalid_opts(body_to_on_stream);
+        false -> ok
     end.
 
 %%%-----------------------------------------------------------------------------

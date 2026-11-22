@@ -13,7 +13,11 @@ batches, on the connection alone. A switch to `eager` credits the whole
 outstanding debt at once.
 A test sends it SETTINGS, GOAWAY and WINDOW_UPDATE frames at any moment.
 A request whose path is `/body/N` is answered with a body of `N` octets,
-whatever `response_body` says.
+whatever `response_body` says. `/frames/N/S` is answered with `N` DATA
+frames of `S` octets each, as the windows of the client allow.
+`/reset/Code` is answered with RST_STREAM and that error code. `/manual`
+is answered by the test alone, with the `headers`, `data` and
+`rst_stream` commands.
 
 Every connection records what the client did: the streams it opened, the
 request octets it sent, the DATA frames it sent and the largest of them,
@@ -65,6 +69,9 @@ GOAWAY with a chosen last stream id, and credits on read. This peer can.
     | {credit, credit_policy()}
     | {window_update, pos_integer()}
     | {stream_window_update, nhttp_lib:stream_id(), pos_integer()}
+    | {headers, nhttp_lib:stream_id(), nhttp_lib:headers(), nhttp_h2:fin()}
+    | {data, nhttp_lib:stream_id(), binary(), nhttp_h2:fin()}
+    | {rst_stream, nhttp_lib:stream_id(), nhttp_h2:error_code()}
     | {ping, binary()}.
 
 -type opts() :: #{
@@ -110,10 +117,17 @@ GOAWAY with a chosen last stream id, and credits on read. This peer can.
 %%%-----------------------------------------------------------------------------
 %%% RECORDS
 %%%-----------------------------------------------------------------------------
+-type answer() ::
+    undefined
+    | manual
+    | {body, non_neg_integer()}
+    | {frames, non_neg_integer(), pos_integer()}
+    | {reset, nhttp_h2:error_code()}.
+
 -record(stream, {
     responded = false :: boolean(),
-    body = undefined :: undefined | non_neg_integer(),
-    rest = undefined :: undefined | binary()
+    answer = undefined :: answer(),
+    rest = undefined :: undefined | {binary(), nhttp_h2:fin()}
 }).
 
 -record(conn, {
@@ -352,7 +366,7 @@ after_events(Conn) ->
 on_event({request, StreamId, Request, Fin}, #conn{stats = Stats, streams = Streams} = Conn) ->
     #{requests := Requests, streams := Seen} = Stats,
     Conn1 = Conn#conn{
-        streams = Streams#{StreamId => #stream{body = path_body_size(Request)}},
+        streams = Streams#{StreamId => #stream{answer = path_answer(Request)}},
         stats = Stats#{requests => Requests + 1, streams => [StreamId | Seen]}
     },
     maybe_schedule(StreamId, Fin, Conn1);
@@ -446,6 +460,10 @@ respond(StreamId, #conn{goaway_last = Last} = Conn) when Last =/= undefined, Str
     Conn;
 respond(StreamId, #conn{streams = Streams} = Conn) ->
     case maps:find(StreamId, Streams) of
+        {ok, #stream{answer = manual}} ->
+            Conn;
+        {ok, #stream{responded = false, answer = {reset, Code}}} ->
+            send_reset(StreamId, Code, Conn);
         {ok, #stream{responded = false} = Stream} ->
             after_first_response(send_response(StreamId, Stream, Conn));
         _Gone ->
@@ -453,52 +471,95 @@ respond(StreamId, #conn{streams = Streams} = Conn) ->
     end.
 
 -spec send_response(nhttp_lib:stream_id(), #stream{}, #conn{}) -> #conn{}.
-send_response(StreamId, Stream, #conn{h2 = H2, opts = Opts, stats = Stats} = Conn) ->
-    BodySize = response_body_size(Stream, Opts),
+send_response(StreamId, Stream, #conn{opts = Opts} = Conn) ->
+    Answer = answer(Stream, Opts),
     Headers = [{<<":status">>, <<"200">>}, {<<"x-stream">>, integer_to_binary(StreamId)}],
-    Fin = fin_for(BodySize),
+    Conn1 = send_headers(StreamId, Headers, fin_for(Answer), Conn),
+    send_answer(StreamId, Answer, Conn1).
+
+-spec send_headers(nhttp_lib:stream_id(), nhttp_lib:headers(), nhttp_h2:fin(), #conn{}) -> #conn{}.
+send_headers(StreamId, Headers, Fin, #conn{h2 = H2, streams = Streams, stats = Stats} = Conn) ->
     case nhttp_h2:send_headers(H2, StreamId, Headers, Fin) of
         {ok, H2b, Frame} ->
             #{responses := Responses} = Stats,
-            Conn1 = Conn#conn{
+            Stream = maps:get(StreamId, Streams, #stream{}),
+            Conn#conn{
                 h2 = H2b,
                 out = [Conn#conn.out, Frame],
                 stats = Stats#{responses => Responses + 1},
-                streams = (Conn#conn.streams)#{StreamId => Stream#stream{responded = true}}
-            },
-            send_body(StreamId, BodySize, Conn1);
+                streams = headers_sent(StreamId, Stream#stream{responded = true}, Fin, Streams)
+            };
         {error, _Reason} ->
-            Conn#conn{streams = maps:remove(StreamId, Conn#conn.streams)}
+            Conn#conn{streams = maps:remove(StreamId, Streams)}
     end.
 
--spec fin_for(non_neg_integer()) -> nhttp_h2:fin().
-fin_for(0) -> fin;
-fin_for(_Size) -> nofin.
+-spec headers_sent(nhttp_lib:stream_id(), #stream{}, nhttp_h2:fin(), Streams) -> Streams when
+    Streams :: #{nhttp_lib:stream_id() => #stream{}}.
+headers_sent(StreamId, _Stream, fin, Streams) -> maps:remove(StreamId, Streams);
+headers_sent(StreamId, Stream, nofin, Streams) -> Streams#{StreamId => Stream}.
 
--spec send_body(nhttp_lib:stream_id(), non_neg_integer(), #conn{}) -> #conn{}.
-send_body(_StreamId, 0, Conn) ->
+-spec send_reset(nhttp_lib:stream_id(), nhttp_h2:error_code(), #conn{}) -> #conn{}.
+send_reset(StreamId, Code, #conn{h2 = H2, streams = Streams} = Conn) ->
+    {ok, H2b, Frame} = nhttp_h2:send_rst_stream(H2, StreamId, Code),
+    Conn#conn{h2 = H2b, out = [Conn#conn.out, Frame], streams = maps:remove(StreamId, Streams)}.
+
+-spec fin_for(answer()) -> nhttp_h2:fin().
+fin_for({body, 0}) -> fin;
+fin_for({frames, 0, _Size}) -> fin;
+fin_for(_Answer) -> nofin.
+
+-spec send_answer(nhttp_lib:stream_id(), answer(), #conn{}) -> #conn{}.
+send_answer(_StreamId, {body, 0}, Conn) ->
     Conn;
-send_body(StreamId, BodySize, Conn) ->
-    send_data(StreamId, binary:copy(<<$b>>, BodySize), Conn).
+send_answer(StreamId, {body, BodySize}, Conn) ->
+    send_data(StreamId, binary:copy(<<$b>>, BodySize), fin, Conn);
+send_answer(StreamId, {frames, _Count, _Size}, Conn) ->
+    send_frames(StreamId, Conn).
 
--spec send_data(nhttp_lib:stream_id(), binary(), #conn{}) -> #conn{}.
-send_data(StreamId, Body, #conn{h2 = H2, streams = Streams} = Conn) ->
-    case nhttp_h2:send_data(H2, StreamId, Body, fin) of
+-spec send_frames(nhttp_lib:stream_id(), #conn{}) -> #conn{}.
+send_frames(StreamId, #conn{streams = Streams} = Conn) ->
+    case maps:find(StreamId, Streams) of
+        {ok, #stream{rest = undefined, answer = {frames, Left, Size}} = Stream} when Left > 0 ->
+            Fin = last_frame(Left),
+            Next = Stream#stream{answer = {frames, Left - 1, Size}},
+            Conn1 = Conn#conn{streams = Streams#{StreamId => Next}},
+            send_frames(StreamId, send_data(StreamId, binary:copy(<<$f>>, Size), Fin, Conn1));
+        _Blocked ->
+            Conn
+    end.
+
+-spec last_frame(pos_integer()) -> nhttp_h2:fin().
+last_frame(1) -> fin;
+last_frame(_Left) -> nofin.
+
+-spec send_data(nhttp_lib:stream_id(), binary(), nhttp_h2:fin(), #conn{}) -> #conn{}.
+send_data(StreamId, Body, Fin, #conn{h2 = H2, streams = Streams} = Conn) ->
+    case nhttp_h2:send_data(H2, StreamId, Body, Fin) of
         {ok, H2b, Frames} ->
             Conn1 = note_sent(StreamId, byte_size(Body), Conn#conn{h2 = H2b}),
             Conn1#conn{
                 out = [Conn1#conn.out, Frames],
-                streams = maps:remove(StreamId, Streams)
+                streams = data_sent(StreamId, Fin, Streams)
             };
-        {partial, H2b, Frames, Rest, fin, _Window} ->
+        {partial, H2b, Frames, Rest, Fin, _Window} ->
             Conn1 = note_sent(StreamId, byte_size(Body) - byte_size(Rest), Conn#conn{h2 = H2b}),
             Stream = maps:get(StreamId, Streams, #stream{responded = true}),
             Conn1#conn{
                 out = [Conn1#conn.out, Frames],
-                streams = Streams#{StreamId => Stream#stream{rest = Rest}}
+                streams = Streams#{StreamId => Stream#stream{rest = {Rest, Fin}}}
             };
         {error, _Reason} ->
             Conn#conn{streams = maps:remove(StreamId, Streams)}
+    end.
+
+-spec data_sent(nhttp_lib:stream_id(), nhttp_h2:fin(), Streams) -> Streams when
+    Streams :: #{nhttp_lib:stream_id() => #stream{}}.
+data_sent(StreamId, fin, Streams) ->
+    maps:remove(StreamId, Streams);
+data_sent(StreamId, nofin, Streams) ->
+    case maps:find(StreamId, Streams) of
+        {ok, Stream} -> Streams#{StreamId => Stream#stream{rest = undefined}};
+        error -> Streams
     end.
 
 -spec note_sent(nhttp_lib:stream_id(), non_neg_integer(), #conn{}) -> #conn{}.
@@ -514,10 +575,13 @@ note_sent(StreamId, Size, #conn{stats = Stats} = Conn) ->
 -spec retry_pending(#conn{}) -> #conn{}.
 retry_pending(#conn{streams = Streams} = Conn) ->
     Pending = [
-        {Id, Rest}
-     || {Id, #stream{rest = Rest}} <- maps:to_list(Streams), Rest =/= undefined
+        {Id, Rest, Fin}
+     || {Id, #stream{rest = {Rest, Fin}}} <- maps:to_list(Streams)
     ],
-    lists:foldl(fun({Id, Rest}, Acc) -> send_data(Id, Rest, Acc) end, Conn, Pending).
+    Sent = lists:foldl(
+        fun({Id, Rest, Fin}, Acc) -> send_data(Id, Rest, Fin, Acc) end, Conn, Pending
+    ),
+    lists:foldl(fun send_frames/2, Sent, maps:keys(Sent#conn.streams)).
 
 -spec after_first_response(#conn{}) -> #conn{}.
 after_first_response(#conn{first_response_done = true} = Conn) ->
@@ -550,6 +614,12 @@ on_command({stream_window_update, StreamId, Increment}, #conn{h2 = H2, out = Out
         {ok, H2b, Frame} -> Conn#conn{h2 = H2b, out = [Out, Frame]};
         {error, _Reason} -> Conn
     end;
+on_command({headers, StreamId, Headers, Fin}, Conn) ->
+    send_headers(StreamId, Headers, Fin, Conn);
+on_command({data, StreamId, Payload, Fin}, Conn) ->
+    send_data(StreamId, Payload, Fin, Conn);
+on_command({rst_stream, StreamId, Code}, Conn) ->
+    send_reset(StreamId, Code, Conn);
 on_command({ping, Data}, #conn{out = Out} = Conn) ->
     {ok, Frame} = nhttp_h2_frame:ping(Data),
     Conn#conn{out = [Out, Frame]}.
@@ -653,14 +723,21 @@ note_frame({data, StreamId, _Fin, Payload}, #conn{stats = Stats} = Conn) ->
 note_frame(_Frame, Conn) ->
     Conn.
 
--spec path_body_size(nhttp_lib:request()) -> undefined | non_neg_integer().
-path_body_size(#{path := <<"/body/", Size/binary>>}) ->
-    binary_to_integer(Size);
-path_body_size(_Request) ->
+-spec path_answer(nhttp_lib:request()) -> answer().
+path_answer(#{path := <<"/body/", Size/binary>>}) ->
+    {body, binary_to_integer(Size)};
+path_answer(#{path := <<"/frames/", Spec/binary>>}) ->
+    [Count, Size] = binary:split(Spec, <<"/">>),
+    {frames, binary_to_integer(Count), binary_to_integer(Size)};
+path_answer(#{path := <<"/reset/", Code/binary>>}) ->
+    {reset, binary_to_existing_atom(Code)};
+path_answer(#{path := <<"/manual">>}) ->
+    manual;
+path_answer(_Request) ->
     undefined.
 
--spec response_body_size(#stream{}, opts()) -> non_neg_integer().
-response_body_size(#stream{body = undefined}, Opts) ->
-    maps:get(response_body, Opts, 0);
-response_body_size(#stream{body = Size}, _Opts) ->
-    Size.
+-spec answer(#stream{}, opts()) -> answer().
+answer(#stream{answer = undefined}, Opts) ->
+    {body, maps:get(response_body, Opts, 0)};
+answer(#stream{answer = Answer}, _Opts) ->
+    Answer.

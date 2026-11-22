@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `nhttpc:stream/2` takes `via => {pool, Ref}` and `via => {conn, Conn}`
+  on HTTP/2, with `consume/2` as stream window credit and `cancel/1` as
+  RST_STREAM. Other protocols return
+  `{invalid_opts, stream_requires_http2}`.
+
+### Fixed
+
+- `timeouts => #{request => infinity}` no longer stops the pool manager
+  or a pooled connection.
+- A pooled HTTP/2 request that reaches the request timeout of its
+  connection gives its stream slot back.
+- A `oneshot` stream ends when its owner exits, and uses HTTP/2 on an
+  `http` URL with `versions => [http2]`.
+
 ## [1.1.1] - 2026-10-28
 
 ### Changed

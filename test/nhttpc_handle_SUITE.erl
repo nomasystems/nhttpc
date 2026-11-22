@@ -28,7 +28,8 @@
     is_handle_rejects_non_map/1,
     is_handle_rejects_missing_fields/1,
     is_handle_rejects_invalid_kind/1,
-    is_handle_rejects_wrong_field_types/1
+    is_handle_rejects_wrong_field_types/1,
+    shared_handle_names_a_process_with_other_handles/1
 ]).
 
 %%%-----------------------------------------------------------------------------
@@ -50,7 +51,8 @@ groups() ->
             is_handle_rejects_non_map,
             is_handle_rejects_missing_fields,
             is_handle_rejects_invalid_kind,
-            is_handle_rejects_wrong_field_types
+            is_handle_rejects_wrong_field_types,
+            shared_handle_names_a_process_with_other_handles
         ]}
     ].
 
@@ -112,6 +114,19 @@ is_handle_rejects_invalid_kind(_Config) ->
     Ref = make_ref(),
     ?assertNot(nhttpc_handle:is_handle(#{pid => Pid, ref => Ref, kind => bogus})),
     ?assertNot(nhttpc_handle:is_handle(#{pid => Pid, ref => Ref, kind => undefined})),
+    ok.
+
+shared_handle_names_a_process_with_other_handles(_Config) ->
+    Pid = self(),
+    Ref = make_ref(),
+    Shared = nhttpc_handle:new_shared(Pid, Ref, stream),
+    ?assert(nhttpc_handle:is_handle(Shared)),
+    ?assert(nhttpc_handle:is_shared(Shared)),
+    ?assertNot(nhttpc_handle:is_shared(nhttpc_handle:new(Pid, Ref, stream))),
+    ?assertEqual(
+        {Pid, Ref, stream},
+        {nhttpc_handle:pid(Shared), nhttpc_handle:ref(Shared), nhttpc_handle:kind(Shared)}
+    ),
     ok.
 
 is_handle_rejects_wrong_field_types(_Config) ->
