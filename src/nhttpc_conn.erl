@@ -984,17 +984,8 @@ process_h2_batch(Batch, Data) ->
                 ok ->
                     start_request_timeout_checker(track_send_buffer(Data1));
                 {error, Reason} ->
-                    lists:foreach(
-                        fun({StreamRef, Request, CallerPid, _Opts}) ->
-                            ReqSt = #request_st{
-                                stream_ref = StreamRef, caller_pid = CallerPid, request = Request
-                            },
-                            send_response(
-                                ReqSt, nhttp_error:send_error(Reason), Data1#conn_data.self
-                            )
-                        end,
-                        Batch
-                    ),
+                    {error, SendError} = nhttp_error:send_error(Reason),
+                    fail_all_requests(Data1, SendError),
                     exit({error, Reason})
             end
     end.
@@ -2269,38 +2260,25 @@ start_idle_checker(
 %%%-----------------------------------------------------------------------------
 %% REQUEST TIMEOUT CHECKER
 %%%-----------------------------------------------------------------------------
+-doc """
+Answer every request whose deadline passed. Each one leaves through
+`complete_request/3`, so its stream slot and caller monitor go back.
+""".
 -spec handle_check_request_timeouts(#conn_data{}) -> #conn_data{}.
 handle_check_request_timeouts(#conn_data{requests = Requests} = Data) ->
     Now = erlang:monotonic_time(millisecond),
-    {Expired, Active} = maps:fold(
-        fun(Ref, #request_st{deadline = Deadline} = ReqSt, {ExpAcc, ActAcc}) ->
+    Expired = maps:fold(
+        fun(Ref, #request_st{deadline = Deadline} = ReqSt, Acc) ->
             case Deadline =/= undefined andalso Now >= Deadline of
-                true ->
-                    {[{Ref, ReqSt} | ExpAcc], ActAcc};
-                false ->
-                    {ExpAcc, ActAcc#{Ref => ReqSt}}
+                true -> [{Ref, ReqSt} | Acc];
+                false -> Acc
             end
         end,
-        {[], #{}},
+        [],
         Requests
     ),
-    Data1 = lists:foldl(
-        fun({_Ref, ReqSt}, AccData) ->
-            #request_st{stream_id = StreamId} = ReqSt,
-            send_response(ReqSt, timeout_reason(ReqSt, AccData), AccData#conn_data.self),
-            case {AccData#conn_data.protocol, StreamId} of
-                {http2, SId} when SId =/= undefined ->
-                    AccData1 = reset_h2_stream(SId, AccData),
-                    NewIndex = maps:remove(SId, AccData1#conn_data.stream_index),
-                    AccData1#conn_data{stream_index = NewIndex};
-                _ ->
-                    AccData
-            end
-        end,
-        Data#conn_data{requests = Active},
-        Expired
-    ),
-    case maps:size(Active) of
+    Data1 = lists:foldl(fun expire_request/2, Data, Expired),
+    case map_size(Data1#conn_data.requests) of
         0 ->
             stop_request_timeout_checker(Data1);
         _ ->
@@ -2308,6 +2286,15 @@ handle_check_request_timeouts(#conn_data{requests = Requests} = Data) ->
                 ?REQUEST_TIMEOUT_CHECK_INTERVAL, Data1#conn_data.self, check_request_timeouts
             ),
             maybe_report_send_queue(Data1#conn_data{request_timeout_check_ref = TimerRef})
+    end.
+
+-spec expire_request({reference(), #request_st{}}, #conn_data{}) -> #conn_data{}.
+expire_request({Ref, #request_st{stream_id = StreamId} = ReqSt}, #conn_data{self = Self} = Data) ->
+    ok = send_response(ReqSt, timeout_reason(ReqSt, Data), Self),
+    Data1 = complete_request(Ref, StreamId, Data),
+    case {Data1#conn_data.protocol, StreamId} of
+        {http2, SId} when SId =/= undefined -> reset_h2_stream(SId, Data1);
+        _ -> Data1
     end.
 
 -spec start_request_timeout_checker(#conn_data{}) -> #conn_data{}.
