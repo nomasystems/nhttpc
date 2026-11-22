@@ -274,7 +274,7 @@ touching the manager.
 
 -record(waiter, {
     from :: gen_server:from(),
-    deadline :: integer(),
+    deadline :: integer() | infinity,
     queued_at :: integer(),
     exclude :: pid() | undefined,
     body_size :: non_neg_integer()
@@ -1012,12 +1012,10 @@ which is what the caller asked for when it named the exclusion.
 -spec queue_waiter(gen_server:from(), timeout(), pid() | undefined, non_neg_integer(), #state{}) ->
     {noreply, #state{}}.
 queue_waiter(From, Timeout, Exclude, BodySize, State) ->
-    Now = erlang:monotonic_time(millisecond),
-    Deadline = Now + Timeout,
     QueuedAt = erlang:monotonic_time(),
     Waiter = #waiter{
         from = From,
-        deadline = Deadline,
+        deadline = waiter_deadline(Timeout),
         queued_at = QueuedAt,
         exclude = Exclude,
         body_size = BodySize
@@ -1028,6 +1026,12 @@ queue_waiter(From, Timeout, Exclude, BodySize, State) ->
     },
     NewState = sync_checkin_flag(start_waiter_timeout_checker(NewState0)),
     {noreply, maybe_serve_waiters(NewState)}.
+
+-spec waiter_deadline(timeout()) -> integer() | infinity.
+waiter_deadline(infinity) ->
+    infinity;
+waiter_deadline(Timeout) ->
+    erlang:monotonic_time(millisecond) + Timeout.
 
 -doc """
 Whether one more attempt is allowed for a stream that never opened. Both
@@ -1810,22 +1814,27 @@ serve_waiter(
 %%%-----------------------------------------------------------------------------
 %% INTERNAL: PERIODIC WAITER TIMEOUT CHECKER
 %%%-----------------------------------------------------------------------------
--spec expire_front_waiters(integer(), queue:queue(#waiter{}), non_neg_integer(), #state{}) ->
+-doc "Answer every waiter whose deadline passed. Deadlines are not in queue order.".
+-spec expire_waiters(integer(), queue:queue(#waiter{}), #state{}) ->
     {queue:queue(#waiter{}), non_neg_integer()}.
-expire_front_waiters(Now, Waiters, ExpiredCount, State) ->
-    case queue:out(Waiters) of
-        {{value, #waiter{deadline = D, from = From}}, Rest} when Now >= D ->
-            emit_pool_timeout(State#state.telemetry_config, State#state.ref),
-            gen_server:reply(From, nhttp_error:checkout_timeout()),
-            expire_front_waiters(Now, Rest, ExpiredCount + 1, State);
-        _ ->
-            {Waiters, ExpiredCount}
-    end.
+expire_waiters(Now, Waiters, State) ->
+    Kept = queue:filter(fun(Waiter) -> not expire_waiter(Now, Waiter, State) end, Waiters),
+    {Kept, queue:len(Waiters) - queue:len(Kept)}.
+
+-spec expire_waiter(integer(), #waiter{}, #state{}) -> boolean().
+expire_waiter(_Now, #waiter{deadline = infinity}, _State) ->
+    false;
+expire_waiter(Now, #waiter{deadline = Deadline}, _State) when Now < Deadline ->
+    false;
+expire_waiter(_Now, #waiter{from = From}, State) ->
+    emit_pool_timeout(State#state.telemetry_config, State#state.ref),
+    gen_server:reply(From, nhttp_error:checkout_timeout()),
+    true.
 
 -spec handle_check_waiter_timeouts(#state{}) -> #state{}.
 handle_check_waiter_timeouts(#state{waiters = Waiters, ready_waiters = ReadyWaiters} = State) ->
     Now = erlang:monotonic_time(millisecond),
-    {NewWaiters, Expired} = expire_front_waiters(Now, Waiters, 0, State),
+    {NewWaiters, Expired} = expire_waiters(Now, Waiters, State),
     ActiveReadyWaiters = lists:filter(
         fun(#ready_waiter{from = From, deadline = Deadline}) ->
             case Now >= Deadline of

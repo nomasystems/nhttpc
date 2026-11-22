@@ -100,7 +100,8 @@ that queued octets are about to spend.
 -type send_opts() :: #{
     max_response_size => pos_integer() | infinity,
     max_header_size => pos_integer() | infinity,
-    max_headers_count => pos_integer() | infinity
+    max_headers_count => pos_integer() | infinity,
+    request_timeout => timeout()
 }.
 
 -type h1_mode() :: ready | draining.
@@ -853,8 +854,7 @@ encode_h2_stream(
     #conn_data{
         h2_conn = H2Conn1,
         h2_scheme = Scheme,
-        h2_authority = Authority,
-        request_timeout = RequestTimeout
+        h2_authority = Authority
     } = Data
 ) ->
     Headers = nhttpc_h2:request_to_h2_headers(Request, Scheme, Authority),
@@ -872,7 +872,7 @@ encode_h2_stream(
         caller_mref = MRef,
         request = Request,
         stream_id = StreamId,
-        deadline = erlang:monotonic_time(millisecond) + RequestTimeout,
+        deadline = request_deadline(Opts, Data),
         max_response_size = max_response_size(Opts)
     },
     case nhttp_h2:send_headers(H2Conn1, StreamId, Headers, EndStream) of
@@ -1017,6 +1017,14 @@ register_h2_request(
         caller_monitors = Mons#{MRef => StreamRef}
     }.
 
+-doc "The deadline of a request. `infinity` gives none.".
+-spec request_deadline(send_opts(), #conn_data{}) -> integer() | undefined.
+request_deadline(Opts, #conn_data{request_timeout = ConnTimeout}) ->
+    case maps:get(request_timeout, Opts, ConnTimeout) of
+        infinity -> undefined;
+        Timeout -> erlang:monotonic_time(millisecond) + Timeout
+    end.
+
 -spec send_h1_single(
     iolist(), reference(), reference(), #request_st{}, #{reference() => #request_st{}}, #conn_data{}
 ) ->
@@ -1024,8 +1032,7 @@ register_h2_request(
 send_h1_single(IOList, MRef, StreamRef, ReqSt, Requests, #conn_data{socket = Socket} = Data) ->
     case nhttp_sock:send(Socket, IOList) of
         ok ->
-            Deadline = erlang:monotonic_time(millisecond) + Data#conn_data.request_timeout,
-            NewReqSt = ReqSt#request_st{deadline = Deadline},
+            NewReqSt = ReqSt#request_st{deadline = request_deadline(#{}, Data)},
             CallerMons = (Data#conn_data.caller_monitors)#{MRef => StreamRef},
             Data1 = Data#conn_data{
                 current_request = StreamRef,
