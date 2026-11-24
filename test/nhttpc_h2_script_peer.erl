@@ -183,6 +183,7 @@ start(Config, Opts) ->
         binary,
         {active, false},
         {reuseaddr, true},
+        {backlog, 128},
         {certfile, CertFile},
         {keyfile, KeyFile},
         {alpn_preferred_protocols, [<<"h2">>]}
