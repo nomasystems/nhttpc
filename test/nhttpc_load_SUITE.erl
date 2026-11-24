@@ -398,9 +398,9 @@ sustained_load_mixed_methods(Config) ->
             spawn(fun() ->
                 {Method, Body} =
                     case N rem 4 of
-                        0 -> {get, undefined};
+                        0 -> {get, <<>>};
                         1 -> {post, <<"test body">>};
-                        2 -> {head, undefined};
+                        2 -> {head, <<>>};
                         3 -> {put, <<"put body">>}
                     end,
                 Req = #{
@@ -425,8 +425,7 @@ sustained_load_mixed_methods(Config) ->
         [length(Successes), length(Errors), NumRequests]
     ),
 
-    %% At least 50% success rate (HTTP/1.1 pools have limited concurrency)
-    ?assert(length(Successes) >= 25),
+    ?assertEqual(NumRequests, length(Successes)),
 
     %% Cleanup
     unlink(PoolSup),
