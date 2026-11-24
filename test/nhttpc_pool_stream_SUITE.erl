@@ -52,6 +52,8 @@
 -export([
     connection_timeout_gives_the_stream_slot_back/1,
     http1_pool_rejects_a_stream/1,
+    invalid_consume_initial_is_rejected/1,
+    invalid_via_is_rejected/1,
     infinite_timeout_request_waits_for_a_connection/1,
     infinite_timeout_stream_waits_for_a_connection/1,
     iterator_body_is_rejected/1,
@@ -124,6 +126,8 @@ groups() ->
             stream_on_an_open_connection,
             http1_pool_rejects_a_stream,
             unknown_pool_is_an_error,
+            invalid_consume_initial_is_rejected,
+            invalid_via_is_rejected,
             iterator_body_is_rejected,
             infinite_timeout_stream_waits_for_a_connection,
             infinite_timeout_request_waits_for_a_connection,
@@ -459,6 +463,25 @@ unknown_pool_is_an_error(_Config) ->
         nhttpc:stream(get_request(<<"/x">>), #{via => {pool, ps_no_such_pool}})
     ),
     ok.
+
+invalid_consume_initial_is_rejected(_Config) ->
+    lists:foreach(
+        fun(Via) ->
+            lists:foreach(
+                fun(Credit) ->
+                    ?assertEqual(
+                        {error, {invalid_opts, invalid_consume_initial}},
+                        nhttpc:stream(manual(), #{via => Via, consume_initial => Credit})
+                    )
+                end,
+                [invalid, -1, 1.5]
+            )
+        end,
+        [oneshot, {pool, ps_no_such_pool}]
+    ).
+
+invalid_via_is_rejected(_Config) ->
+    ?assertEqual({error, {invalid_opts, invalid_via}}, nhttpc:stream(manual(), #{via => pool})).
 
 iterator_body_is_rejected(Config) ->
     {Peer, Sup, _Conn} = start(ps_iterator, Config, #{}),

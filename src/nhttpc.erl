@@ -1329,8 +1329,10 @@ start_stream({conn, #{pid := ConnPid, version := http2}}, Req, _UrlInfo, Opts) -
             ConnPid, Req, stream_send_opts(Opts), nhttpc_opts:timeout(request, Opts)
         )
     end;
-start_stream({conn, _Connection}, _Req, _UrlInfo, _Opts) ->
-    nhttpc_error:invalid_opts(stream_requires_http2).
+start_stream({conn, #{version := _NotHttp2}}, _Req, _UrlInfo, _Opts) ->
+    nhttpc_error:invalid_opts(stream_requires_http2);
+start_stream(_Via, _Req, _UrlInfo, _Opts) ->
+    nhttpc_error:invalid_opts(invalid_via).
 
 -spec stream_send_opts(opts()) -> nhttpc_conn:send_opts().
 stream_send_opts(Opts) ->
@@ -1342,6 +1344,10 @@ stream_send_opts(Opts) ->
     end.
 
 -spec validate_stream_opts(opts()) -> ok | {error, error()}.
+validate_stream_opts(#{consume_initial := Credit}) when
+    Credit =/= infinity, not (is_integer(Credit) andalso Credit >= 0)
+->
+    nhttpc_error:invalid_opts(invalid_consume_initial);
 validate_stream_opts(Opts) ->
     case maps:is_key(body_to, Opts) of
         true -> nhttpc_error:invalid_opts(body_to_on_stream);
