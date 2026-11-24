@@ -41,7 +41,7 @@ other, and the connection starts a new guard when one exits.
 %%%-----------------------------------------------------------------------------
 -record(state, {
     conn_mref :: reference(),
-    streams = #{} :: #{nhttpc:handle() => pid()}
+    streams = #{} :: #{nhttpc:handle() => reference()}
 }).
 
 %%%-----------------------------------------------------------------------------
@@ -52,10 +52,10 @@ other, and the connection starts a new guard when one exits.
 closed(Guard, Handle) ->
     gen_server:cast(Guard, {closed, Handle}).
 
--doc "A response stream opened, with `Owner` as the process that gets its events.".
--spec opened(pid(), nhttpc:handle(), pid()) -> ok.
-opened(Guard, Handle, Owner) ->
-    gen_server:cast(Guard, {opened, Handle, Owner}).
+-doc "A response stream opened, with `Alias` as the alias that takes its last event.".
+-spec opened(pid(), nhttpc:handle(), reference()) -> ok.
+opened(Guard, Handle, Alias) ->
+    gen_server:cast(Guard, {opened, Handle, Alias}).
 
 -doc "The connection sent the last event of each open stream, and exits.".
 -spec release(pid()) -> ok.
@@ -76,10 +76,12 @@ handle_call(_Request, _From, State) ->
     {reply, {error, unknown_call}, State}.
 
 -doc false.
--spec handle_cast({opened, nhttpc:handle(), pid()} | {closed, nhttpc:handle()} | release, #state{}) ->
+-spec handle_cast(
+    {opened, nhttpc:handle(), reference()} | {closed, nhttpc:handle()} | release, #state{}
+) ->
     {noreply, #state{}} | {stop, normal, #state{}}.
-handle_cast({opened, Handle, Owner}, #state{streams = Streams} = State) ->
-    {noreply, State#state{streams = Streams#{Handle => Owner}}};
+handle_cast({opened, Handle, Alias}, #state{streams = Streams} = State) ->
+    {noreply, State#state{streams = Streams#{Handle => Alias}}};
 handle_cast({closed, Handle}, #state{streams = Streams} = State) ->
     {noreply, State#state{streams = maps:remove(Handle, Streams)}};
 handle_cast(release, State) ->
@@ -91,7 +93,7 @@ handle_cast(release, State) ->
 handle_info({'DOWN', MRef, process, _ConnPid, _Reason}, #state{conn_mref = MRef} = State) ->
     {error, Reason} = nhttpc_error:connection_closed(),
     ok = maps:foreach(
-        fun(Handle, Owner) -> Owner ! {nhttpc, Handle, {error, Reason}} end, State#state.streams
+        fun(Handle, Alias) -> Alias ! {nhttpc, Handle, {error, Reason}} end, State#state.streams
     ),
     {stop, normal, State}.
 

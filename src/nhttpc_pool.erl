@@ -557,7 +557,9 @@ start_link(Ref, Tab, Opts) ->
 -doc """
 Open one response stream on a pooled HTTP/2 connection, with the caller
 as its owner. A refused stream is re-dispatched as in `request/4`. The
-connection gives the slot back and tells the pool when the stream ends.
+connection gives the slot back and tells the pool when the stream ends,
+and `nhttpc_conn:open_stream/4` tells the pool of a stream that did not
+open.
 """.
 -spec stream(pid() | term(), nhttp_lib:request(), timeout(), nhttpc_conn:send_opts()) ->
     {ok, nhttpc:handle()} | {error, nhttpc:error()}.
@@ -945,14 +947,13 @@ do_request(PoolRef, Req, Timeout, SendOpts, Start, Attempt, Exclude) ->
 do_stream(PoolRef, Req, Timeout, SendOpts, Start, Attempt, Exclude) ->
     BodySize = nhttpc_h2:credit_claim(Req),
     case acquire(PoolRef, remaining_timeout(Timeout, Start), Exclude, BodySize) of
-        {ok, ConnPid, Owner} ->
+        {ok, ConnPid, _Owner} ->
             Remaining = remaining_timeout(Timeout, Start),
             Result = nhttpc_conn:open_stream(ConnPid, Req, SendOpts, Remaining),
             case nhttpc_error:wrap_result(Result) of
                 {ok, _Handle} = Opened ->
                     Opened;
                 {error, {stream_error, {protocol, refused_stream}}} = Refused ->
-                    ok = release(Owner, ConnPid),
                     case redispatch_allowed(Timeout, Start, Attempt) of
                         true ->
                             do_stream(
@@ -962,7 +963,6 @@ do_stream(PoolRef, Req, Timeout, SendOpts, Start, Attempt, Exclude) ->
                             Refused
                     end;
                 {error, _} = Error ->
-                    ok = release(Owner, ConnPid),
                     Error
             end;
         {error, _} = Error ->

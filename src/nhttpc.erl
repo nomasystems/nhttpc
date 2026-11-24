@@ -1118,6 +1118,8 @@ The call blocks until the worker has torn down any in-flight request
 and acknowledged, then drains the caller's mailbox of
 `{nhttpc, Handle, _}` so the no-leak contract holds. Returns `ok`.
 A stream on a shared connection is reset with RST_STREAM and CANCEL.
+When a process that is not the owner cancels it, the owner gets
+`{error, {stream_error, cancelled}}`.
 """.
 -spec cancel(handle()) -> ok.
 cancel(Handle) ->
@@ -1130,6 +1132,7 @@ cancel(Handle) ->
 -spec cancel_on_connection(handle()) -> ok.
 cancel_on_connection(Handle) ->
     ok = nhttpc_conn:cancel_stream(nhttpc_handle:pid(Handle), nhttpc_handle:ref(Handle)),
+    ok = nhttpc_conn:retire_alias(nhttpc_handle:ref(Handle)),
     flush(Handle).
 
 -spec cancel_worker(handle()) -> ok.
@@ -1339,8 +1342,12 @@ stream_send_opts(Opts) ->
     SendOpts = maps:with([max_response_size], Opts),
     Stream = SendOpts#{stream => maps:with([consume_initial], Opts)},
     case Opts of
-        #{timeouts := #{request := Timeout}} -> Stream#{request_timeout => Timeout};
-        #{} -> Stream
+        #{timeouts := #{request := infinity}} ->
+            Stream#{request_deadline => infinity};
+        #{timeouts := #{request := Timeout}} ->
+            Stream#{request_deadline => erlang:monotonic_time(millisecond) + Timeout};
+        #{} ->
+            Stream
     end.
 
 -spec validate_stream_opts(opts()) -> ok | {error, error()}.

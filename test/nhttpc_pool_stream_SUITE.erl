@@ -22,6 +22,8 @@
 %%% EXPORTS - EVENTS
 %%%-----------------------------------------------------------------------------
 -export([
+    cancel_after_a_connection_exit_leaves_no_event/1,
+    cancel_from_another_process_reaches_the_owner/1,
     cancel_resets_the_stream_and_keeps_the_connection/1,
     connection_exit_reaches_the_owner/1,
     connection_exit_reaches_the_owner_after_a_guard_exit/1,
@@ -61,7 +63,8 @@
     pool_without_a_request_timeout_serves/1,
     refused_stream_goes_to_another_connection/1,
     stream_on_an_open_connection/1,
-    unknown_pool_is_an_error/1
+    unknown_pool_is_an_error/1,
+    wait_for_a_connection_counts_towards_the_stream_timeout/1
 ]).
 
 %%%-----------------------------------------------------------------------------
@@ -88,6 +91,7 @@
 -define(HEAP_SAMPLE_MS, 2).
 -define(ADVANCE, 100000).
 -define(SHORT_TIMEOUT_MS, 300).
+-define(BUDGET_MS, 2000).
 -define(SLOW_PEER_MS, 2000).
 
 %%%-----------------------------------------------------------------------------
@@ -107,6 +111,8 @@ groups() ->
             trailers_come_before_done,
             response_without_body_ends_with_done,
             cancel_resets_the_stream_and_keeps_the_connection,
+            cancel_from_another_process_reaches_the_owner,
+            cancel_after_a_connection_exit_leaves_no_event,
             owner_exit_resets_the_stream,
             peer_reset_carries_the_reason_of_request,
             goaway_lets_a_live_stream_finish,
@@ -128,6 +134,7 @@ groups() ->
             unknown_pool_is_an_error,
             invalid_consume_initial_is_rejected,
             invalid_via_is_rejected,
+            wait_for_a_connection_counts_towards_the_stream_timeout,
             iterator_body_is_rejected,
             infinite_timeout_stream_waits_for_a_connection,
             infinite_timeout_request_waits_for_a_connection,
@@ -213,6 +220,44 @@ cancel_resets_the_stream_and_keeps_the_connection(Config) ->
     ),
     ?assertEqual([Conn], nhttpc_h2_script_peer:connections(Peer)),
     ?assert(is_process_alive(nhttpc_handle:pid(H))),
+    stop(Peer, Sup).
+
+cancel_from_another_process_reaches_the_owner(Config) ->
+    {Peer, Sup, Conn} = start(ps_other_cancel, Config, #{}),
+    {ok, H} = nhttpc:stream(manual(), #{via => {pool, ps_other_cancel}}),
+    Id = stream_id(Conn, 1),
+    {Pid, MRef} = spawn_monitor(fun() -> ok = nhttpc:cancel(H) end),
+    receive
+        {'DOWN', MRef, process, Pid, normal} -> ok
+    after ?WAIT_MS -> ct:fail("cancel/1 never returned")
+    end,
+    ?assertEqual({error, {stream_error, cancelled}}, event(H)),
+    ?assertEqual(quiet, quiet(H)),
+    ok = wait_reset(Conn, Id),
+    stop(Peer, Sup).
+
+%% The guard sends its event after the connection is gone. A cancel that
+%% returns in between must leave no event for the owner to find later.
+cancel_after_a_connection_exit_leaves_no_event(Config) ->
+    {Peer, Sup, _Conn} = start(ps_late_guard, Config, #{}),
+    {ok, H} = nhttpc:stream(manual(), #{via => {pool, ps_late_guard}}),
+    ConnPid = nhttpc_handle:pid(H),
+    [Guard] = guards_of(ConnPid),
+    ok = sys:suspend(Guard),
+    GuardMRef = monitor(process, Guard),
+    ConnMRef = monitor(process, ConnPid),
+    exit(ConnPid, kill),
+    receive
+        {'DOWN', ConnMRef, process, ConnPid, killed} -> ok
+    after ?WAIT_MS -> ct:fail("the connection never exited")
+    end,
+    ok = nhttpc:cancel(H),
+    ok = sys:resume(Guard),
+    receive
+        {'DOWN', GuardMRef, process, Guard, normal} -> ok
+    after ?WAIT_MS -> ct:fail("the guard never exited")
+    end,
+    ?assertEqual(quiet, quiet(H)),
     stop(Peer, Sup).
 
 owner_exit_resets_the_stream(Config) ->
@@ -483,6 +528,30 @@ invalid_consume_initial_is_rejected(_Config) ->
 invalid_via_is_rejected(_Config) ->
     ?assertEqual({error, {invalid_opts, invalid_via}}, nhttpc:stream(manual(), #{via => pool})).
 
+%% The stream timeout starts at the call. One second goes to the wait for
+%% a stream slot, so the stream ends one second after it opens.
+wait_for_a_connection_counts_towards_the_stream_timeout(Config) ->
+    {Peer, Sup, _Conn} = start(ps_budget, Config, #{settings => #{max_concurrent_streams => 1}}),
+    Via = #{via => {pool, ps_budget}},
+    {ok, First} = nhttpc:stream(manual(), Via),
+    Test = self(),
+    Owner = spawn_link(fun() ->
+        {ok, H} = nhttpc:stream(manual(), Via#{timeouts => #{request => ?BUDGET_MS}}),
+        Test ! {opened, self()},
+        Test ! {last_event, self(), event(H)}
+    end),
+    timer:sleep(?BUDGET_MS div 2),
+    ok = nhttpc:cancel(First),
+    receive
+        {opened, Owner} -> ok
+    after ?WAIT_MS -> ct:fail("the stream never opened")
+    end,
+    receive
+        {last_event, Owner, Event} -> ?assertEqual({error, {timeout, request}}, Event)
+    after ?BUDGET_MS * 3 div 4 -> ct:fail("the wait for a connection did not count")
+    end,
+    stop(Peer, Sup).
+
 iterator_body_is_rejected(Config) ->
     {Peer, Sup, _Conn} = start(ps_iterator, Config, #{}),
     Iterator = fun() -> fin end,
@@ -581,21 +650,34 @@ pool_without_a_request_timeout_serves(Config) ->
     ?assertEqual({ok, ?SMALL_BODY}, download(H)),
     stop(Peer, Sup).
 
+%% The connection does not answer for longer than the timeout of the
+%% stream. `stream/2` returns only when the connection took the cancel,
+%% and the pool hears of one checkin for the stream.
 open_timeout_cancels_the_stream(Config) ->
-    {Peer, Sup, Conn} = start(ps_open_timeout, Config, #{
+    {Peer, Port} = nhttpc_h2_script_peer:start(Config, #{
         settings => #{max_concurrent_streams => 1}
     }),
+    Sup = start_pool(ps_open_timeout, Port, #{otel => #{events => true}}),
+    {ok, [Conn]} = nhttpc_h2_script_peer:wait_connections(Peer, 1, ?WAIT_MS),
     Via = #{via => {pool, ps_open_timeout}},
     {ok, Probe} = nhttpc:stream(get_request(<<"/body/0">>), Via),
     ?assertEqual({ok, 0}, download(Probe)),
     ConnPid = nhttpc_handle:pid(Probe),
     ok = sys:suspend(ConnPid),
+    Checkins = counters:new(1, []),
+    ok = telemetry:attach(
+        ps_open_timeout, [nhttpc, pool, checkin], fun count_event/4, Checkins
+    ),
     Test = self(),
     Owner = spawn_link(fun() ->
         Result = nhttpc:stream(manual(), Via#{timeouts => #{request => ?SHORT_TIMEOUT_MS}}),
         Test ! {open_result, self(), Result, erlang:process_info(self(), messages)}
     end),
-    timer:sleep(2 * ?SHORT_TIMEOUT_MS),
+    receive
+        {open_result, Owner, Early, _Messages} ->
+            ct:fail("stream/2 returned ~p before the connection took the cancel", [Early])
+    after ?WAIT_MS + 2 * ?SHORT_TIMEOUT_MS -> ok
+    end,
     ok = sys:resume(ConnPid),
     receive
         {open_result, Owner, Result, {messages, Left}} ->
@@ -603,6 +685,8 @@ open_timeout_cancels_the_stream(Config) ->
             ?assertEqual([], Left)
     after 2 * ?WAIT_MS -> ct:fail("stream/2 never returned")
     end,
+    ok = telemetry:detach(ps_open_timeout),
+    ?assertEqual(1, counters:get(Checkins, 1)),
     ?assertMatch({ok, #{status := 200}}, nhttpc:request(get_request(<<"/body/10">>), Via)),
     ?assertEqual([Conn], nhttpc_h2_script_peer:connections(Peer)),
     stop(Peer, Sup).
@@ -801,6 +885,10 @@ pool_connections(Pool) ->
      || T <- ets:all(), ets:info(T, owner) =:= Sup, ets:info(T, name) =:= nhttpc_registry
     ],
     nhttpc_registry:get_multiplexed_conns(Tab).
+
+-spec count_event(telemetry:event_name(), map(), map(), counters:counters_ref()) -> ok.
+count_event(_Event, _Measurements, _Metadata, Counter) ->
+    counters:add(Counter, 1, 1).
 
 -spec peer_stats(pid()) -> nhttpc_h2_script_peer:stats().
 peer_stats(Conn) ->

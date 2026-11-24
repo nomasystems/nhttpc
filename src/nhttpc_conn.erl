@@ -82,6 +82,7 @@ process with no last event.
     info/1,
     open_stream/4,
     ping/2,
+    retire_alias/1,
     send_async/3,
     send_async/4,
     start_link/1,
@@ -112,7 +113,7 @@ process with no last event.
     max_response_size => pos_integer() | infinity,
     max_header_size => pos_integer() | infinity,
     max_headers_count => pos_integer() | infinity,
-    request_timeout => timeout(),
+    request_deadline => integer() | infinity,
     stream => stream_opts()
 }.
 
@@ -169,7 +170,6 @@ process with no last event.
 -define(CREDIT_REPORT_INTERVAL_US, 1_000_000).
 -define(SEND_QUEUE_REPORT_INTERVAL_MS, 1000).
 -define(CONNECTION_STREAM_ID, 0).
--define(CANCEL_STREAM_TIMEOUT, 5000).
 
 %%%-----------------------------------------------------------------------------
 %% RECORDS
@@ -268,8 +268,9 @@ cancel(ConnPid, Ref) ->
     call(ConnPid, {cancel, Ref}, 5000).
 
 -doc """
-Reset a stream and wait for the ack. The connection is never killed,
-because it carries the streams of other owners.
+Reset a stream and wait, with no time limit, for the ack or for the
+exit of the connection. The connection is never killed, because it
+carries the streams of other owners.
 """.
 -spec cancel_stream(pid(), reference()) -> ok.
 cancel_stream(ConnPid, Ref) ->
@@ -281,9 +282,6 @@ cancel_stream(ConnPid, Ref) ->
             ok;
         {'DOWN', MRef, process, ConnPid, _Reason} ->
             ok
-    after ?CANCEL_STREAM_TIMEOUT ->
-        demonitor(MRef, [flush]),
-        ok
     end.
 
 -spec info(pid()) ->
@@ -301,34 +299,62 @@ until the stream is open. An error return means that no event follows.
 """.
 -spec open_stream(pid(), nhttp_lib:request(), send_opts(), timeout()) ->
     {ok, nhttpc:handle()} | {error, nhttpc_error:any_reason()}.
-open_stream(ConnPid, Request, Opts, Timeout) ->
-    Ref = monitor(process, ConnPid),
+open_stream(ConnPid, Request, #{stream := StreamOpts} = Opts, Timeout) ->
+    Ref = alias([reply]),
+    MRef = monitor(process, ConnPid),
     ConnPid ! {send, Ref, Request, self(), Opts},
     receive
         {nhttpc_stream_opened, ConnPid, Ref} ->
-            demonitor(Ref, [flush]),
+            demonitor(MRef, [flush]),
             {ok, nhttpc_handle:new_shared(ConnPid, Ref, stream)};
         {nhttpc_error, ConnPid, Ref, Reason} ->
-            demonitor(Ref, [flush]),
+            ok = abandon_stream(ConnPid, Ref, MRef, StreamOpts),
             {error, Reason};
-        {'DOWN', Ref, process, ConnPid, Reason} ->
+        {'DOWN', MRef, process, ConnPid, Reason} ->
+            ok = abandon_stream(ConnPid, Ref, MRef, StreamOpts),
             {error, {connection_down, Reason}}
     after Timeout ->
         ok = cancel_stream(ConnPid, Ref),
-        demonitor(Ref, [flush]),
-        ok = flush_stream(ConnPid, Ref),
+        ok = abandon_stream(ConnPid, Ref, MRef, StreamOpts),
         nhttp_error:request_timeout(Timeout)
     end.
+
+-doc """
+Leave a stream that `open_stream/4` does not return. A connection that
+opened the stream tells the pool itself when the cancel ends it. In
+every other case the pool hears of the checkin here, so it hears of
+exactly one.
+""".
+-spec abandon_stream(pid(), reference(), reference(), stream_opts()) -> ok.
+abandon_stream(ConnPid, Ref, MRef, StreamOpts) ->
+    demonitor(MRef, [flush]),
+    ok = retire_alias(Ref),
+    receive
+        {nhttpc_stream_opened, ConnPid, Ref} -> ok
+    after 0 ->
+        ok = pool_checkin(stream_pool(StreamOpts), ConnPid)
+    end,
+    flush_stream(ConnPid, Ref).
 
 -spec flush_stream(pid(), reference()) -> ok.
 flush_stream(ConnPid, Ref) ->
     Handle = nhttpc_handle:new_shared(ConnPid, Ref, stream),
     receive
-        {nhttpc_stream_opened, ConnPid, Ref} -> flush_stream(ConnPid, Ref);
         {nhttpc_error, ConnPid, Ref, _Reason} -> flush_stream(ConnPid, Ref);
         {nhttpc, Handle, _Event} -> flush_stream(ConnPid, Ref)
     after 0 ->
         ok
+    end.
+
+-doc """
+Stop the alias that carries the last event of a stream. `false` is an
+alias that the last event used already, or the alias of another process.
+""".
+-spec retire_alias(reference()) -> ok.
+retire_alias(Alias) ->
+    case unalias(Alias) of
+        true -> ok;
+        false -> ok
     end.
 
 -spec ping(pid(), timeout()) -> pong | {error, nhttpc_error:any_reason()}.
@@ -1103,11 +1129,14 @@ register_h2_request(
 
 -doc "The deadline of a request. `infinity` gives none.".
 -spec request_deadline(send_opts(), #conn_data{}) -> integer() | undefined.
-request_deadline(Opts, #conn_data{request_timeout = ConnTimeout}) ->
-    case maps:get(request_timeout, Opts, ConnTimeout) of
-        infinity -> undefined;
-        Timeout -> erlang:monotonic_time(millisecond) + Timeout
-    end.
+request_deadline(#{request_deadline := infinity}, _Data) ->
+    undefined;
+request_deadline(#{request_deadline := Deadline}, _Data) ->
+    Deadline;
+request_deadline(_Opts, #conn_data{request_timeout = infinity}) ->
+    undefined;
+request_deadline(_Opts, #conn_data{request_timeout = Timeout}) ->
+    erlang:monotonic_time(millisecond) + Timeout.
 
 -spec send_h1_single(
     iolist(), reference(), reference(), #request_st{}, #{reference() => #request_st{}}, #conn_data{}
@@ -1689,7 +1718,8 @@ do_cancel(Ref, AckFun, #conn_data{requests = Requests} = Data) ->
         undefined ->
             AckFun({error, not_found}),
             Data;
-        #request_st{stream_id = StreamId} ->
+        #request_st{stream_id = StreamId} = ReqSt ->
+            ok = stream_cancelled(ReqSt),
             Data1 = complete_request(Ref, StreamId, Data),
             case {Data#conn_data.protocol, StreamId} of
                 {http2, SId} when SId =/= undefined ->
@@ -2094,7 +2124,7 @@ send_queue_report_due(ReportedAt, Now) ->
 ) -> ok.
 send_response(#request_st{stream = #stream_st{}} = ReqSt, {error, Reason}, _Self) ->
     {error, Public} = nhttpc_error:wrap(Reason),
-    stream_event(ReqSt, {error, Public});
+    last_stream_event(ReqSt, {error, Public});
 send_response(
     #request_st{stream_ref = StreamRef, caller_pid = CallerPid}, {ok, _} = Result, Self
 ) ->
@@ -2192,7 +2222,7 @@ close_response_stream(_ReqSt, _Data) ->
     nhttp_h2:fin(), reference(), nhttp_lib:stream_id(), #request_st{}, #conn_data{}
 ) -> #conn_data{}.
 end_stream_on_fin(fin, Ref, StreamId, ReqSt, Data) ->
-    ok = stream_event(ReqSt, {done, normal}),
+    ok = last_stream_event(ReqSt, {done, normal}),
     complete_request(Ref, StreamId, Data);
 end_stream_on_fin(nofin, Ref, _StreamId, ReqSt, Data) ->
     update_request(Ref, ReqSt, Data).
@@ -2217,8 +2247,8 @@ handle_stream_guard_down(_MRef, Data) ->
     Data.
 
 -spec guard_response_stream(pid(), #request_st{}) -> ok.
-guard_response_stream(Guard, #request_st{stream = #stream_st{handle = Handle}, caller_pid = Owner}) ->
-    nhttpc_stream_guard:opened(Guard, Handle, Owner);
+guard_response_stream(Guard, #request_st{stream = #stream_st{handle = Handle}, stream_ref = Alias}) ->
+    nhttpc_stream_guard:opened(Guard, Handle, Alias);
 guard_response_stream(_Guard, #request_st{stream = undefined}) ->
     ok.
 
@@ -2263,6 +2293,29 @@ stream_data(_ReqSt, <<>>) ->
     ok;
 stream_data(ReqSt, Chunk) ->
     stream_event(ReqSt, {data, Chunk, more}).
+
+-doc """
+Send the last event of a response stream through the alias of its
+owner. The alias takes one message, so the owner gets one last event
+when this process and the guard both send one, and none after a cancel
+stopped the alias.
+""".
+-spec last_stream_event(#request_st{}, nhttpc:event()) -> ok.
+last_stream_event(#request_st{stream = #stream_st{handle = Handle}, stream_ref = Alias}, Event) ->
+    Alias ! {nhttpc, Handle, Event},
+    ok.
+
+-doc """
+Tell the owner that a cancel ended its stream. The owner that cancelled
+drops the event, and an owner that did not cancel learns that its
+stream is over.
+""".
+-spec stream_cancelled(#request_st{}) -> ok.
+stream_cancelled(#request_st{stream = #stream_st{}} = ReqSt) ->
+    {error, Reason} = nhttpc_error:stream_error(cancelled),
+    last_stream_event(ReqSt, {error, Reason});
+stream_cancelled(#request_st{stream = undefined}) ->
+    ok.
 
 -spec stream_event(#request_st{}, nhttpc:event()) -> ok.
 stream_event(#request_st{stream = #stream_st{handle = Handle}, caller_pid = Owner}, Event) ->
