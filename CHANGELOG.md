@@ -7,12 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-11-25
+
 ### Added
 
 - `nhttpc:stream/2` takes `via => {pool, Ref}` and `via => {conn, Conn}`
   on HTTP/2, with `consume/2` as stream window credit and `cancel/1` as
   RST_STREAM. Other protocols return
   `{invalid_opts, stream_requires_http2}`.
+- `nhttpc:request/2` and `nhttpc:stream/2` take a `{stream, Source}`
+  body and `body_from` with `via => {pool, Ref}` and
+  `via => {conn, Conn}` on HTTP/2. The source runs in a process of its
+  own, and the stream window of the peer is its backpressure. Such a
+  request has no retry and follows no redirect. Other protocols return
+  `{invalid_request, stream_body_requires_http2}`.
 
 ### Fixed
 
@@ -22,6 +30,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   connection gives its stream slot back.
 - A `oneshot` stream ends when its owner exits, and uses HTTP/2 on an
   `http` URL with `versions => [http2]`.
+- A request body that is not iodata no longer stops a pooled
+  connection. The request returns `{invalid_request, invalid_body}`.
+- `nhttpc:stream/2` with `via => oneshot` and a `{stream, Source}` body
+  returns `{invalid_request, stream_body_requires_shared_connection}`.
+  The stream worker no longer stops with `badarg`.
 
 ## [1.1.1] - 2026-10-28
 

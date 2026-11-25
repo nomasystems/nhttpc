@@ -58,7 +58,7 @@
     invalid_via_is_rejected/1,
     infinite_timeout_request_waits_for_a_connection/1,
     infinite_timeout_stream_waits_for_a_connection/1,
-    iterator_body_is_rejected/1,
+    iterator_body_opens_a_stream/1,
     open_timeout_cancels_the_stream/1,
     pool_without_a_request_timeout_serves/1,
     refused_stream_goes_to_another_connection/1,
@@ -135,7 +135,7 @@ groups() ->
             invalid_consume_initial_is_rejected,
             invalid_via_is_rejected,
             wait_for_a_connection_counts_towards_the_stream_timeout,
-            iterator_body_is_rejected,
+            iterator_body_opens_a_stream,
             infinite_timeout_stream_waits_for_a_connection,
             infinite_timeout_request_waits_for_a_connection,
             connection_timeout_gives_the_stream_slot_back,
@@ -552,13 +552,13 @@ wait_for_a_connection_counts_towards_the_stream_timeout(Config) ->
     end,
     stop(Peer, Sup).
 
-iterator_body_is_rejected(Config) ->
+iterator_body_opens_a_stream(Config) ->
     {Peer, Sup, _Conn} = start(ps_iterator, Config, #{}),
     Iterator = fun() -> fin end,
     Req = #{method => post, path => <<"/body/0">>, headers => [], body => {stream, Iterator}},
-    ?assertMatch(
-        {error, {invalid_request, _}}, nhttpc:stream(Req, #{via => {pool, ps_iterator}})
-    ),
+    {ok, H} = nhttpc:stream(Req, #{via => {pool, ps_iterator}}),
+    ?assertMatch({headers, 200, _}, event(H)),
+    ?assertEqual({done, normal}, event(H)),
     ?assertMatch(
         {ok, #{status := 200}},
         nhttpc:request(get_request(<<"/body/10">>), #{via => {pool, ps_iterator}})

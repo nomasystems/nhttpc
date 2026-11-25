@@ -21,6 +21,7 @@ header-to-response conversion is needed.
     codec_settings/0,
     credit_claim/1,
     max_send_buffer/0,
+    measure_body/1,
     new_response_acc/0,
     process_h2_response_events/4,
 
@@ -45,12 +46,15 @@ header-to-response conversion is needed.
 %%%-----------------------------------------------------------------------------
 -doc """
 The octets of a request body on an HTTP/2 connection. A request without
-a body, or one whose body streams from a source the pool cannot measure,
-has a size of zero here.
+a body, or one whose body is not iodata, has a size of zero here. The
+connection refuses a body that is not iodata.
 """.
 -spec body_size(nhttp_lib:request()) -> non_neg_integer().
-body_size(#{body := Body}) when is_binary(Body); is_list(Body) ->
-    iolist_size(Body);
+body_size(#{body := Body}) ->
+    case measure_body(Body) of
+        {ok, Size} -> Size;
+        {error, invalid_body} -> 0
+    end;
 body_size(_Request) ->
     0.
 
@@ -84,6 +88,23 @@ credit_claim(Request) ->
 -spec max_send_buffer() -> pos_integer().
 max_send_buffer() ->
     ?MAX_SEND_BUFFER.
+
+-doc """
+The octets of a body, or `invalid_body` for a term that is not iodata.
+`iolist_size/1` is the one test of iodata that the runtime has, and it
+raises for a term that fails it.
+""".
+-spec measure_body(term()) -> {ok, non_neg_integer()} | {error, invalid_body}.
+measure_body(Body) when is_binary(Body) ->
+    {ok, byte_size(Body)};
+measure_body(Body) when is_list(Body) ->
+    try
+        {ok, iolist_size(Body)}
+    catch
+        error:badarg -> {error, invalid_body}
+    end;
+measure_body(_Body) ->
+    {error, invalid_body}.
 
 -doc "Convert request map to HTTP/2 request headers. Uses \"https\" as the default scheme. Extracts host header for :authority.".
 -spec request_to_h2_headers(nhttp_lib:request()) -> nhttp_lib:headers().

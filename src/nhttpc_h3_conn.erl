@@ -637,11 +637,36 @@ drain_sends(Acc, Remaining) ->
     reference(), nhttp_lib:request(), pid(), nhttpc_conn:send_opts(), #h3_data{}
 ) ->
     {ok, #h3_data{}} | {error, term(), #h3_data{}}.
-encode_h3_request_noflush(StreamRef, _Request, CallerPid, #{stream := _}, Data) ->
-    Reason = {invalid_opts, stream_requires_http2},
-    ok = reject_send(StreamRef, CallerPid, Reason, Data),
-    {error, Reason, Data};
-encode_h3_request_noflush(
+encode_h3_request_noflush(StreamRef, Request, CallerPid, Opts, Data) ->
+    case send_refusal(Request, Opts) of
+        none ->
+            open_h3_request_noflush(StreamRef, Request, CallerPid, Opts, Data);
+        Reason ->
+            ok = reject_send(StreamRef, CallerPid, Reason, Data),
+            {error, Reason, Data}
+    end.
+
+-doc """
+Why this connection does not take a send, or `none`. It takes no stream
+mode, no body from a source, and no body that is not iodata.
+""".
+-spec send_refusal(nhttp_lib:request(), nhttpc_conn:send_opts()) ->
+    none | {invalid_opts | invalid_request, atom()}.
+send_refusal(_Request, #{stream := #{upload := _}}) ->
+    {invalid_request, stream_body_requires_http2};
+send_refusal(_Request, #{stream := _}) ->
+    {invalid_opts, stream_requires_http2};
+send_refusal(Request, _Opts) ->
+    case nhttpc_h2:measure_body(maps:get(body, Request, <<>>)) of
+        {ok, _BodySize} -> none;
+        {error, invalid_body} -> {invalid_request, invalid_body}
+    end.
+
+-spec open_h3_request_noflush(
+    reference(), nhttp_lib:request(), pid(), nhttpc_conn:send_opts(), #h3_data{}
+) ->
+    {ok, #h3_data{}} | {error, term(), #h3_data{}}.
+open_h3_request_noflush(
     StreamRef,
     Request,
     CallerPid,

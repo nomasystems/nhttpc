@@ -52,6 +52,7 @@
     h3_get_request/1,
     h3_post_with_body/1,
     h3_empty_body/1,
+    h3_invalid_body_is_rejected/1,
     h3_multiple_sequential/1,
     h3_large_response/1
 ]).
@@ -173,6 +174,7 @@ groups() ->
             h3_get_request,
             h3_post_with_body,
             h3_empty_body,
+            h3_invalid_body_is_rejected,
             h3_multiple_sequential,
             h3_large_response
         ]},
@@ -487,6 +489,34 @@ h3_empty_body(Config) ->
     after 10000 ->
         ct:fail("No response received for GET /empty")
     end,
+    ok.
+
+h3_invalid_body_is_rejected(Config) ->
+    {ok, ConnPid} = get_conn(Config),
+    Refused = [
+        {not_a_body, #{}, {invalid_request, invalid_body}},
+        {[<<"improper">> | tail], #{}, {invalid_request, invalid_body}},
+        {{stream, fun() -> fin end}, #{}, {invalid_request, invalid_body}},
+        {<<>>, #{stream => #{upload => self()}}, {invalid_request, stream_body_requires_http2}}
+    ],
+    lists:foreach(
+        fun({Body, SendOpts, Reason}) ->
+            Req = #{method => post, path => <<"/echo">>, headers => [], body => Body},
+            {ok, Ref} = nhttpc_h3_conn:send_async(ConnPid, Req, self(), SendOpts),
+            receive
+                {nhttpc_error, ConnPid, Ref, Got} -> ?assertEqual({Body, Reason}, {Body, Got})
+            after 10000 -> ct:fail("No answer for the body ~p", [Body])
+            end
+        end,
+        Refused
+    ),
+    Get = #{method => get, path => <<"/empty">>, headers => []},
+    {ok, GetRef} = nhttpc_h3_conn:send_async(ConnPid, Get, self()),
+    receive
+        {nhttpc_response, ConnPid, GetRef, {ok, Resp}} -> ?assertEqual(200, maps:get(status, Resp))
+    after 10000 -> ct:fail("The connection did not serve a request after the refusals")
+    end,
+    ?assert(is_process_alive(ConnPid)),
     ok.
 
 h3_multiple_sequential(Config) ->
