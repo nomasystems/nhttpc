@@ -22,10 +22,12 @@ This module handles:
     add_host_header/4,
     build_connect_opts/2,
     detect_protocol/1,
+    detect_protocol/2,
 
     get_content_encoding/1,
     get_header_value/2,
     h1_parse_opts/1,
+    is_streaming_body/1,
     maybe_add_accept_encoding/2,
 
     recv_h2_settings/3
@@ -628,12 +630,26 @@ build_connect_opts(Transport, Opts) ->
 
 -spec detect_protocol(nhttp_sock:t()) -> http1_1 | http2.
 detect_protocol(Socket) ->
+    detect_protocol(Socket, [http2, http1_1]).
+
+-doc """
+The ALPN protocol when `Versions` allows it. With no ALPN: HTTP/1.1,
+or HTTP/2 with prior knowledge when `Versions` leaves HTTP/1.1 out.
+""".
+-spec detect_protocol(nhttp_sock:t(), [nhttp_lib:version()]) -> http1_1 | http2.
+detect_protocol(Socket, Versions) ->
     case nhttp_sock:negotiated_protocol(Socket) of
-        {ok, <<"h2">>} -> http2;
-        {ok, <<"http/1.1">>} -> http1_1;
-        {ok, <<"http/1.0">>} -> http1_1;
-        {error, no_alpn} -> http1_1;
-        _ -> http1_1
+        {ok, <<"h2">>} -> allowed_or(http2, http1_1, Versions);
+        {error, no_alpn} -> allowed_or(http1_1, http2, Versions);
+        _Other -> http1_1
+    end.
+
+-spec allowed_or(Version, Version, [nhttp_lib:version()]) -> Version when
+    Version :: http1_1 | http2.
+allowed_or(Version, Fallback, Versions) ->
+    case lists:member(Version, Versions) of
+        true -> Version;
+        false -> Fallback
     end.
 
 -spec do_pooled_request(nhttp_lib:request(), nhttpc_url:http_url_info(), term(), nhttpc:opts()) ->

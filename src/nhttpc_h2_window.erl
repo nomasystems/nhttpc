@@ -21,6 +21,13 @@ data to send on a stream it closed.
 A stream that ends without a last frame, by RST_STREAM or by a local
 cancel, leaves its debt behind unless the caller drops it with
 `forget/2`.
+
+## Streams with a consumer
+
+`hold/3` gives the stream credit of one stream to its consumer. An octet
+of that stream is credited when the consumer returned it with
+`release/3`, and never before it arrived. Credit returned ahead pays for
+octets on arrival. The connection credit still goes back on arrival.
 """.
 
 %%%-----------------------------------------------------------------------------
@@ -30,7 +37,9 @@ cancel, leaves its debt behind unless the caller drops it with
     connection_threshold/0,
     consume/4,
     forget/2,
-    new/1
+    hold/3,
+    new/1,
+    release/3
 ]).
 
 %%%-----------------------------------------------------------------------------
@@ -48,10 +57,17 @@ cancel, leaves its debt behind unless the caller drops it with
 %% MACROS
 %%%-----------------------------------------------------------------------------
 -define(CONNECTION_THRESHOLD, 32768).
+
+-record(held, {
+    advance :: non_neg_integer(),
+    unread = 0 :: non_neg_integer(),
+    debt = 0 :: non_neg_integer()
+}).
+
 -record(window, {
     stream_threshold :: pos_integer(),
     connection_debt = 0 :: non_neg_integer(),
-    streams = #{} :: #{nhttp_lib:stream_id() => pos_integer()}
+    streams = #{} :: #{nhttp_lib:stream_id() => pos_integer() | #held{}}
 }).
 
 -opaque t() :: #window{}.
@@ -85,6 +101,11 @@ peer closed it or the client reset it, so no credit is owed on it.
 forget(StreamId, #window{streams = Streams} = Window) ->
     Window#window{streams = maps:remove(StreamId, Streams)}.
 
+-doc "Give the stream credit of `StreamId` to its consumer, with `Advance` octets returned ahead.".
+-spec hold(nhttp_lib:stream_id(), non_neg_integer(), t()) -> t().
+hold(StreamId, Advance, #window{streams = Streams} = Window) ->
+    Window#window{streams = Streams#{StreamId => #held{advance = Advance}}}.
+
 -doc """
 A window policy for a connection whose streams open with `StreamWindow`
 octets of receive credit, the value the client advertises as
@@ -93,6 +114,23 @@ SETTINGS_INITIAL_WINDOW_SIZE.
 -spec new(pos_integer()) -> t().
 new(StreamWindow) ->
     #window{stream_threshold = max(1, StreamWindow div 2)}.
+
+-doc "Account for `Octets` that the consumer of a held stream returned.".
+-spec release(nhttp_lib:stream_id(), pos_integer(), t()) -> {[credit()], t()}.
+release(StreamId, Octets, #window{streams = Streams} = Window) ->
+    case Streams of
+        #{StreamId := #held{advance = Advance, unread = Unread, debt = Debt} = Held} ->
+            Paid = min(Unread, Octets),
+            held_credit(
+                StreamId,
+                Held#held{
+                    advance = Advance + Octets - Paid, unread = Unread - Paid, debt = Debt + Paid
+                },
+                Window
+            );
+        #{} ->
+            {[], Window}
+    end.
 
 %%%-----------------------------------------------------------------------------
 %% INTERNAL
@@ -105,6 +143,17 @@ connection_credit(nofin, Debt, Window) when Debt < ?CONNECTION_THRESHOLD ->
 connection_credit(_Fin, Debt, Window) ->
     {[{connection, Debt}], Window#window{connection_debt = 0}}.
 
+-spec held_credit(nhttp_lib:stream_id(), #held{}, #window{}) -> {[credit()], #window{}}.
+held_credit(
+    StreamId,
+    #held{debt = Debt} = Held,
+    #window{streams = Streams, stream_threshold = Threshold} =
+        Window
+) when Debt >= Threshold ->
+    {[{StreamId, Debt}], Window#window{streams = Streams#{StreamId => Held#held{debt = 0}}}};
+held_credit(StreamId, Held, #window{streams = Streams} = Window) ->
+    {[], Window#window{streams = Streams#{StreamId => Held}}}.
+
 -spec stream_credit(nhttp_lib:stream_id(), non_neg_integer(), nhttp_h2:fin(), #window{}) ->
     {[credit()], #window{}}.
 stream_credit(StreamId, _Octets, fin, Window) ->
@@ -112,10 +161,18 @@ stream_credit(StreamId, _Octets, fin, Window) ->
 stream_credit(
     StreamId, Octets, nofin, #window{streams = Streams, stream_threshold = Threshold} = Window
 ) ->
-    Debt = maps:get(StreamId, Streams, 0) + Octets,
-    case Debt >= Threshold of
-        true ->
-            {[{StreamId, Debt}], forget(StreamId, Window)};
-        false ->
-            {[], Window#window{streams = Streams#{StreamId => Debt}}}
+    case maps:get(StreamId, Streams, 0) of
+        #held{advance = Advance, unread = Unread, debt = Debt} = Held ->
+            Paid = min(Advance, Octets),
+            held_credit(
+                StreamId,
+                Held#held{
+                    advance = Advance - Paid, unread = Unread + Octets - Paid, debt = Debt + Paid
+                },
+                Window
+            );
+        Debt when Debt + Octets >= Threshold ->
+            {[{StreamId, Debt + Octets}], forget(StreamId, Window)};
+        Debt ->
+            {[], Window#window{streams = Streams#{StreamId => Debt + Octets}}}
     end.

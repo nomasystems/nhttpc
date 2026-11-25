@@ -218,6 +218,7 @@ touching the manager.
     request/4,
     resolve/1,
     start_link/3,
+    stream/4,
     target/1,
     update_max_streams/3,
     wait_ready/2
@@ -274,7 +275,7 @@ touching the manager.
 
 -record(waiter, {
     from :: gen_server:from(),
-    deadline :: integer(),
+    deadline :: integer() | infinity,
     queued_at :: integer(),
     exclude :: pid() | undefined,
     body_size :: non_neg_integer()
@@ -552,6 +553,20 @@ resolve(Ref) ->
     {ok, pid()} | {error, nhttpc_error:any_reason()}.
 start_link(Ref, Tab, Opts) ->
     gen_server:start_link(?MODULE, {Ref, Tab, Opts}, []).
+
+-doc """
+Open one response stream on a pooled HTTP/2 connection, with the caller
+as its owner. A refused stream is re-dispatched as in `request/4`. The
+connection gives the slot back and tells the pool when the stream ends,
+and `nhttpc_conn:open_stream/4` tells the pool of a stream that did not
+open.
+""".
+-spec stream(pid() | term(), nhttp_lib:request(), timeout(), nhttpc_conn:send_opts()) ->
+    {ok, nhttpc:handle()} | {error, nhttpc:error()}.
+stream(PoolRef, Req, Timeout, SendOpts) ->
+    #{stream := StreamOpts} = SendOpts,
+    Pooled = SendOpts#{stream := StreamOpts#{pool => PoolRef}},
+    do_stream(PoolRef, Req, Timeout, Pooled, erlang:monotonic_time(millisecond), 0, undefined).
 
 -doc """
 Connection target (`scheme`, `host`, `port`) for the given pool
@@ -919,6 +934,41 @@ do_request(PoolRef, Req, Timeout, SendOpts, Start, Attempt, Exclude) ->
             Error
     end.
 
+-spec do_stream(
+    pid() | term(),
+    nhttp_lib:request(),
+    timeout(),
+    nhttpc_conn:send_opts(),
+    integer(),
+    non_neg_integer(),
+    pid() | undefined
+) ->
+    {ok, nhttpc:handle()} | {error, nhttpc:error()}.
+do_stream(PoolRef, Req, Timeout, SendOpts, Start, Attempt, Exclude) ->
+    BodySize = nhttpc_h2:credit_claim(Req),
+    case acquire(PoolRef, remaining_timeout(Timeout, Start), Exclude, BodySize) of
+        {ok, ConnPid, _Owner} ->
+            Remaining = remaining_timeout(Timeout, Start),
+            Result = nhttpc_conn:open_stream(ConnPid, Req, SendOpts, Remaining),
+            case nhttpc_error:wrap_result(Result) of
+                {ok, _Handle} = Opened ->
+                    Opened;
+                {error, {stream_error, {protocol, refused_stream}}} = Refused ->
+                    case redispatch_allowed(Timeout, Start, Attempt) of
+                        true ->
+                            do_stream(
+                                PoolRef, Req, Timeout, SendOpts, Start, Attempt + 1, ConnPid
+                            );
+                        false ->
+                            Refused
+                    end;
+                {error, _} = Error ->
+                    Error
+            end;
+        {error, _} = Error ->
+            nhttpc_error:wrap(Error)
+    end.
+
 -spec grow_or_queue(gen_server:from(), timeout(), pid() | undefined, non_neg_integer(), #state{}) ->
     {noreply, #state{}} | {reply, term(), #state{}}.
 grow_or_queue(From, Timeout, Exclude, BodySize, State) ->
@@ -1012,12 +1062,10 @@ which is what the caller asked for when it named the exclusion.
 -spec queue_waiter(gen_server:from(), timeout(), pid() | undefined, non_neg_integer(), #state{}) ->
     {noreply, #state{}}.
 queue_waiter(From, Timeout, Exclude, BodySize, State) ->
-    Now = erlang:monotonic_time(millisecond),
-    Deadline = Now + Timeout,
     QueuedAt = erlang:monotonic_time(),
     Waiter = #waiter{
         from = From,
-        deadline = Deadline,
+        deadline = waiter_deadline(Timeout),
         queued_at = QueuedAt,
         exclude = Exclude,
         body_size = BodySize
@@ -1028,6 +1076,12 @@ queue_waiter(From, Timeout, Exclude, BodySize, State) ->
     },
     NewState = sync_checkin_flag(start_waiter_timeout_checker(NewState0)),
     {noreply, maybe_serve_waiters(NewState)}.
+
+-spec waiter_deadline(timeout()) -> integer() | infinity.
+waiter_deadline(infinity) ->
+    infinity;
+waiter_deadline(Timeout) ->
+    erlang:monotonic_time(millisecond) + Timeout.
 
 -doc """
 Whether one more attempt is allowed for a stream that never opened. Both
@@ -1810,22 +1864,27 @@ serve_waiter(
 %%%-----------------------------------------------------------------------------
 %% INTERNAL: PERIODIC WAITER TIMEOUT CHECKER
 %%%-----------------------------------------------------------------------------
--spec expire_front_waiters(integer(), queue:queue(#waiter{}), non_neg_integer(), #state{}) ->
+-doc "Answer every waiter whose deadline passed. Deadlines are not in queue order.".
+-spec expire_waiters(integer(), queue:queue(#waiter{}), #state{}) ->
     {queue:queue(#waiter{}), non_neg_integer()}.
-expire_front_waiters(Now, Waiters, ExpiredCount, State) ->
-    case queue:out(Waiters) of
-        {{value, #waiter{deadline = D, from = From}}, Rest} when Now >= D ->
-            emit_pool_timeout(State#state.telemetry_config, State#state.ref),
-            gen_server:reply(From, nhttp_error:checkout_timeout()),
-            expire_front_waiters(Now, Rest, ExpiredCount + 1, State);
-        _ ->
-            {Waiters, ExpiredCount}
-    end.
+expire_waiters(Now, Waiters, State) ->
+    Kept = queue:filter(fun(Waiter) -> not expire_waiter(Now, Waiter, State) end, Waiters),
+    {Kept, queue:len(Waiters) - queue:len(Kept)}.
+
+-spec expire_waiter(integer(), #waiter{}, #state{}) -> boolean().
+expire_waiter(_Now, #waiter{deadline = infinity}, _State) ->
+    false;
+expire_waiter(Now, #waiter{deadline = Deadline}, _State) when Now < Deadline ->
+    false;
+expire_waiter(_Now, #waiter{from = From}, State) ->
+    emit_pool_timeout(State#state.telemetry_config, State#state.ref),
+    gen_server:reply(From, nhttp_error:checkout_timeout()),
+    true.
 
 -spec handle_check_waiter_timeouts(#state{}) -> #state{}.
 handle_check_waiter_timeouts(#state{waiters = Waiters, ready_waiters = ReadyWaiters} = State) ->
     Now = erlang:monotonic_time(millisecond),
-    {NewWaiters, Expired} = expire_front_waiters(Now, Waiters, 0, State),
+    {NewWaiters, Expired} = expire_waiters(Now, Waiters, State),
     ActiveReadyWaiters = lists:filter(
         fun(#ready_waiter{from = From, deadline = Deadline}) ->
             case Now >= Deadline of

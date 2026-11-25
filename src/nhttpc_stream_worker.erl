@@ -35,6 +35,9 @@ Cancellation follows the same `'$nhttpc_cancel'` protocol as
 `nhttpc_request_worker`: the worker kills the linked sub-process,
 acknowledges, then exits before `nhttpc:cancel/1` returns so the
 cancel-no-leak contract holds.
+
+The worker monitors its owner. When the owner exits, the worker stops
+the sub-process, which closes the socket, and exits.
 """.
 
 %%%-----------------------------------------------------------------------------
@@ -55,6 +58,7 @@ cancel-no-leak contract holds.
 
 -record(state, {
     owner :: pid(),
+    owner_mref :: reference(),
     handle :: nhttpc:handle(),
     sub_pid :: pid(),
     sub_mref :: reference(),
@@ -147,6 +151,7 @@ bootstrap(Starter, Ref, Owner, Req, UrlInfo, Opts) ->
     ),
     loop(#state{
         owner = Owner,
+        owner_mref = erlang:monitor(process, Owner),
         handle = Handle,
         sub_pid = SubPid,
         sub_mref = SubMRef,
@@ -176,10 +181,7 @@ build_stream_opts(WorkerPid, Owner, Handle, Opts) ->
 
 -spec carry_transport_opts(map(), nhttpc:opts()) -> map().
 carry_transport_opts(StreamOpts, Opts) ->
-    case maps:get(tls, Opts, undefined) of
-        undefined -> StreamOpts;
-        V -> StreamOpts#{tls => V}
-    end.
+    maps:merge(StreamOpts, maps:with([tls, versions], Opts)).
 
 -spec credit_opts(nhttpc:opts()) -> {non_neg_integer() | infinity, pos_integer()}.
 credit_opts(Opts) ->
@@ -329,10 +331,15 @@ loop(
         sub_mref = SubMRef,
         sub_pid = SubPid,
         owner = Owner,
+        owner_mref = OwnerMRef,
         handle = Handle
     } = State
 ) ->
     receive
+        {'DOWN', OwnerMRef, process, _Owner, _Reason} ->
+            exit(SubPid, cancelled),
+            drain_sub(SubPid, SubMRef),
+            exit(normal);
         {'$nhttpc_data', From, Ref, Bin, Fin} when From =:= SubPid ->
             loop(handle_data(State, From, Ref, Bin, Fin));
         {'$nhttpc_consume', RcvRef, N} ->

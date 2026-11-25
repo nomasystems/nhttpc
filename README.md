@@ -55,7 +55,8 @@ Every async surface delivers `{nhttpc, Handle, Event}` to its owner.
 - **WebSocket** ([RFC 6455](https://www.rfc-editor.org/rfc/rfc6455)) on the same handle protocol as async requests
 - **Three dispatch modes**: one-shot, pooled, or on a caller-owned connection, selected by `via`
 - **Connection pools** that pack HTTP/2 and HTTP/3 streams onto warm connections and grow on stream slots and send credit
-- **Streaming** downloads and uploads with explicit consumer backpressure
+- **Streaming** downloads and uploads with explicit consumer backpressure,
+  on a connection of its own or on one HTTP/2 stream of a pooled connection
 - **Retries** with backoff, method-aware and off by default
 - **Redirects** with a hop cap and credential stripping across origins
 - **Cookie jar** ([RFC 6265](https://www.rfc-editor.org/rfc/rfc6265)) on ETS

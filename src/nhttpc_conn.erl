@@ -50,6 +50,15 @@ The credit slot the pool reserves from tracks the codec's connection
 send window. A queued body settles its claim when it is encoded and
 debits the slot as the codec drains it, so the slot never counts credit
 that queued octets are about to spend.
+
+## Response stream
+
+A request sent with `open_stream/4` runs in stream mode. The process
+holds no body for it and sends each frame of the response to the owner
+as `{nhttpc, Handle, Event}`. The stream window is credited from
+`nhttpc:consume/2` and the connection window on arrival
+(`nhttpc_h2_window`). `nhttpc_stream_guard` covers an exit of this
+process with no last event.
 """.
 
 -include("nhttpc.hrl").
@@ -69,8 +78,11 @@ that queued octets are about to spend.
 %%%-----------------------------------------------------------------------------
 -export([
     cancel/2,
+    cancel_stream/2,
     info/1,
+    open_stream/4,
     ping/2,
+    retire_alias/1,
     send_async/3,
     send_async/4,
     start_link/1,
@@ -96,11 +108,22 @@ that queued octets are about to spend.
 %%%-----------------------------------------------------------------------------
 %% TYPES
 %%%-----------------------------------------------------------------------------
--export_type([conn_opts/0, send_opts/0]).
+-export_type([conn_opts/0, send_opts/0, stream_opts/0]).
 -type send_opts() :: #{
     max_response_size => pos_integer() | infinity,
     max_header_size => pos_integer() | infinity,
-    max_headers_count => pos_integer() | infinity
+    max_headers_count => pos_integer() | infinity,
+    request_deadline => integer() | infinity,
+    stream => stream_opts()
+}.
+
+-doc """
+`consume_initial`: stream credit returned on arrival, ahead of
+`nhttpc:consume/2`. `pool`: the pool to tell when the stream ends.
+""".
+-type stream_opts() :: #{
+    consume_initial => non_neg_integer() | infinity,
+    pool => term()
 }.
 
 -type h1_mode() :: ready | draining.
@@ -161,7 +184,14 @@ that queued octets are about to spend.
     reported_at :: integer() | undefined
 }).
 
+-record(stream_st, {
+    handle :: nhttpc:handle(),
+    advance :: non_neg_integer() | infinity,
+    pool :: {pool, term()} | undefined
+}).
+
 -record(request_st, {
+    stream = undefined :: #stream_st{} | undefined,
     stream_ref :: reference(),
     caller_pid :: pid(),
     caller_mref :: reference() | undefined,
@@ -226,7 +256,8 @@ that queued octets are about to spend.
     streams_opened = 0 :: non_neg_integer(),
     max_streams_per_connection :: pos_integer(),
     rotating = false :: boolean(),
-    drain_grace_ref = undefined :: reference() | undefined
+    drain_grace_ref = undefined :: reference() | undefined,
+    stream_guard = undefined :: {pid(), reference()} | undefined
 }).
 
 %%%-----------------------------------------------------------------------------
@@ -236,6 +267,23 @@ that queued octets are about to spend.
 cancel(ConnPid, Ref) ->
     call(ConnPid, {cancel, Ref}, 5000).
 
+-doc """
+Reset a stream and wait, with no time limit, for the ack or for the
+exit of the connection. The connection is never killed, because it
+carries the streams of other owners.
+""".
+-spec cancel_stream(pid(), reference()) -> ok.
+cancel_stream(ConnPid, Ref) ->
+    MRef = monitor(process, ConnPid),
+    ConnPid ! {'$nhttpc_cancel', Ref, self()},
+    receive
+        {'$nhttpc_cancel_ack', Ref} ->
+            demonitor(MRef, [flush]),
+            ok;
+        {'DOWN', MRef, process, ConnPid, _Reason} ->
+            ok
+    end.
+
 -spec info(pid()) ->
     {ok, #{version := nhttp_lib:version(), peer := nhttp_lib:peer()}}
     | {error, nhttpc_error:any_reason()}.
@@ -243,6 +291,70 @@ info(ConnPid) ->
     case wait_ready(ConnPid, 5000) of
         ok -> call(ConnPid, info, 5000);
         {error, _} = Error -> Error
+    end.
+
+-doc """
+Send a request in stream mode, with the caller as the owner, and wait
+until the stream is open. An error return means that no event follows.
+""".
+-spec open_stream(pid(), nhttp_lib:request(), send_opts(), timeout()) ->
+    {ok, nhttpc:handle()} | {error, nhttpc_error:any_reason()}.
+open_stream(ConnPid, Request, #{stream := StreamOpts} = Opts, Timeout) ->
+    Ref = alias([reply]),
+    MRef = monitor(process, ConnPid),
+    ConnPid ! {send, Ref, Request, self(), Opts},
+    receive
+        {nhttpc_stream_opened, ConnPid, Ref} ->
+            demonitor(MRef, [flush]),
+            {ok, nhttpc_handle:new_shared(ConnPid, Ref, stream)};
+        {nhttpc_error, ConnPid, Ref, Reason} ->
+            ok = abandon_stream(ConnPid, Ref, MRef, StreamOpts),
+            {error, Reason};
+        {'DOWN', MRef, process, ConnPid, Reason} ->
+            ok = abandon_stream(ConnPid, Ref, MRef, StreamOpts),
+            {error, {connection_down, Reason}}
+    after Timeout ->
+        ok = cancel_stream(ConnPid, Ref),
+        ok = abandon_stream(ConnPid, Ref, MRef, StreamOpts),
+        nhttp_error:request_timeout(Timeout)
+    end.
+
+-doc """
+Leave a stream that `open_stream/4` does not return. A connection that
+opened the stream tells the pool itself when the cancel ends it. In
+every other case the pool hears of the checkin here, so it hears of
+exactly one.
+""".
+-spec abandon_stream(pid(), reference(), reference(), stream_opts()) -> ok.
+abandon_stream(ConnPid, Ref, MRef, StreamOpts) ->
+    demonitor(MRef, [flush]),
+    ok = retire_alias(Ref),
+    receive
+        {nhttpc_stream_opened, ConnPid, Ref} -> ok
+    after 0 ->
+        ok = pool_checkin(stream_pool(StreamOpts), ConnPid)
+    end,
+    flush_stream(ConnPid, Ref).
+
+-spec flush_stream(pid(), reference()) -> ok.
+flush_stream(ConnPid, Ref) ->
+    Handle = nhttpc_handle:new_shared(ConnPid, Ref, stream),
+    receive
+        {nhttpc_error, ConnPid, Ref, _Reason} -> flush_stream(ConnPid, Ref);
+        {nhttpc, Handle, _Event} -> flush_stream(ConnPid, Ref)
+    after 0 ->
+        ok
+    end.
+
+-doc """
+Stop the alias that carries the last event of a stream. `false` is an
+alias that the last event used already, or the alias of another process.
+""".
+-spec retire_alias(reference()) -> ok.
+retire_alias(Alias) ->
+    case unalias(Alias) of
+        true -> ok;
+        false -> ok
     end.
 
 -spec ping(pid(), timeout()) -> pong | {error, nhttpc_error:any_reason()}.
@@ -514,7 +626,7 @@ connecting_loop(
     receive
         {connect_result, {ok, Socket}} ->
             Data1 = clear_connector_mref(Data),
-            Protocol = detect_protocol(Socket, Data1#conn_data.protocols),
+            Protocol = nhttpc_request:detect_protocol(Socket, Data1#conn_data.protocols),
             Data2 = Data1#conn_data{socket = Socket, protocol = Protocol},
             complete_connection(Data2);
         {connect_result, {error, Reason}} ->
@@ -635,6 +747,8 @@ ready_loop(#conn_data{parent = Parent} = Data) ->
         {'$nhttpc_cancel', Ref, From} ->
             Data1 = handle_unified_cancel(Ref, From, Data),
             ready_loop(Data1);
+        {'$nhttpc_consume', Ref, Octets} ->
+            ready_loop(handle_consume(Ref, Octets, Data));
         {'$call', From, wait_ready} ->
             reply(From, ok),
             ready_loop(Data);
@@ -647,7 +761,7 @@ ready_loop(#conn_data{parent = Parent} = Data) ->
         {'DOWN', MRef, process, _Pid, _Reason} ->
             case maps:get(MRef, Data#conn_data.caller_monitors, undefined) of
                 undefined ->
-                    ready_loop(Data);
+                    ready_loop(handle_stream_guard_down(MRef, Data));
                 StreamRef ->
                     ready_loop(handle_caller_down(StreamRef, Data))
             end;
@@ -696,6 +810,8 @@ draining_loop(#conn_data{parent = Parent} = Data) ->
         {'$nhttpc_cancel', Ref, From} ->
             Data1 = handle_unified_cancel(Ref, From, Data),
             draining_loop(Data1);
+        {'$nhttpc_consume', Ref, Octets} ->
+            draining_loop(handle_consume(Ref, Octets, Data));
         {'$call', From, wait_ready} ->
             reply(From, {error, draining}),
             draining_loop(Data);
@@ -705,7 +821,7 @@ draining_loop(#conn_data{parent = Parent} = Data) ->
         {'DOWN', MRef, process, _Pid, _Reason} ->
             case maps:get(MRef, Data#conn_data.caller_monitors, undefined) of
                 undefined ->
-                    draining_loop(Data);
+                    draining_loop(handle_stream_guard_down(MRef, Data));
                 StreamRef ->
                     exit_when_drained(handle_caller_down(StreamRef, Data))
             end;
@@ -853,8 +969,7 @@ encode_h2_stream(
     #conn_data{
         h2_conn = H2Conn1,
         h2_scheme = Scheme,
-        h2_authority = Authority,
-        request_timeout = RequestTimeout
+        h2_authority = Authority
     } = Data
 ) ->
     Headers = nhttpc_h2:request_to_h2_headers(Request, Scheme, Authority),
@@ -867,12 +982,13 @@ encode_h2_stream(
         end,
     MRef = erlang:monitor(process, CallerPid),
     ReqSt = #request_st{
+        stream = stream_mode(StreamRef, Opts, Data),
         stream_ref = StreamRef,
         caller_pid = CallerPid,
         caller_mref = MRef,
         request = Request,
         stream_id = StreamId,
-        deadline = erlang:monotonic_time(millisecond) + RequestTimeout,
+        deadline = request_deadline(Opts, Data),
         max_response_size = max_response_size(Opts)
     },
     case nhttp_h2:send_headers(H2Conn1, StreamId, Headers, EndStream) of
@@ -944,6 +1060,9 @@ offer_h2_body(Request, Body, BodySize, StreamId, H2Conn, Data) ->
 
 -spec process_h1_single(reference(), nhttp_lib:request(), pid(), send_opts(), #conn_data{}) ->
     #conn_data{}.
+process_h1_single(StreamRef, _Request, CallerPid, #{stream := _}, Data) ->
+    ok = reject_send(StreamRef, CallerPid, {invalid_opts, stream_requires_http2}, 0, Data),
+    Data;
 process_h1_single(
     StreamRef, Request, CallerPid, Opts, #conn_data{requests = Requests} = Data
 ) ->
@@ -984,17 +1103,8 @@ process_h2_batch(Batch, Data) ->
                 ok ->
                     start_request_timeout_checker(track_send_buffer(Data1));
                 {error, Reason} ->
-                    lists:foreach(
-                        fun({StreamRef, Request, CallerPid, _Opts}) ->
-                            ReqSt = #request_st{
-                                stream_ref = StreamRef, caller_pid = CallerPid, request = Request
-                            },
-                            send_response(
-                                ReqSt, nhttp_error:send_error(Reason), Data1#conn_data.self
-                            )
-                        end,
-                        Batch
-                    ),
+                    {error, SendError} = nhttp_error:send_error(Reason),
+                    fail_all_requests(Data1, SendError),
                     exit({error, Reason})
             end
     end.
@@ -1010,12 +1120,23 @@ register_h2_request(
     H2Conn,
     #conn_data{requests = Requests, stream_index = StreamIndex, caller_monitors = Mons} = Data
 ) ->
-    Data#conn_data{
+    open_response_stream(ReqSt, Data#conn_data{
         h2_conn = H2Conn,
         requests = Requests#{StreamRef => ReqSt},
         stream_index = StreamIndex#{StreamId => StreamRef},
         caller_monitors = Mons#{MRef => StreamRef}
-    }.
+    }).
+
+-doc "The deadline of a request. `infinity` gives none.".
+-spec request_deadline(send_opts(), #conn_data{}) -> integer() | undefined.
+request_deadline(#{request_deadline := infinity}, _Data) ->
+    undefined;
+request_deadline(#{request_deadline := Deadline}, _Data) ->
+    Deadline;
+request_deadline(_Opts, #conn_data{request_timeout = infinity}) ->
+    undefined;
+request_deadline(_Opts, #conn_data{request_timeout = Timeout}) ->
+    erlang:monotonic_time(millisecond) + Timeout.
 
 -spec send_h1_single(
     iolist(), reference(), reference(), #request_st{}, #{reference() => #request_st{}}, #conn_data{}
@@ -1024,8 +1145,7 @@ register_h2_request(
 send_h1_single(IOList, MRef, StreamRef, ReqSt, Requests, #conn_data{socket = Socket} = Data) ->
     case nhttp_sock:send(Socket, IOList) of
         ok ->
-            Deadline = erlang:monotonic_time(millisecond) + Data#conn_data.request_timeout,
-            NewReqSt = ReqSt#request_st{deadline = Deadline},
+            NewReqSt = ReqSt#request_st{deadline = request_deadline(#{}, Data)},
             CallerMons = (Data#conn_data.caller_monitors)#{MRef => StreamRef},
             Data1 = Data#conn_data{
                 current_request = StreamRef,
@@ -1381,6 +1501,10 @@ process_h2_event({request, _StreamId, _Request, _EndStream}, Data) ->
     Data;
 process_h2_event({response, StreamId, Response, EndStream}, Data) ->
     case find_request_by_stream(StreamId, Data) of
+        {ok, Ref, #request_st{stream = #stream_st{}} = ReqSt} ->
+            #{status := Status, headers := Headers} = Response,
+            ok = stream_event(ReqSt, {headers, Status, Headers}),
+            end_stream_on_fin(EndStream, Ref, StreamId, ReqSt, mark_served(Data));
         {ok, Ref, ReqSt} ->
             case EndStream of
                 fin ->
@@ -1395,6 +1519,9 @@ process_h2_event({response, StreamId, Response, EndStream}, Data) ->
     end;
 process_h2_event({trailers, StreamId, Trailers}, Data) ->
     case find_request_by_stream(StreamId, Data) of
+        {ok, Ref, #request_st{stream = #stream_st{}} = ReqSt} ->
+            ok = stream_event(ReqSt, {trailers, Trailers}),
+            end_stream_on_fin(fin, Ref, StreamId, ReqSt, Data);
         {ok, Ref, ReqSt} ->
             Body = iolist_to_binary(lists:reverse(ReqSt#request_st.body_acc)),
             Response = ReqSt#request_st.response,
@@ -1415,6 +1542,10 @@ process_h2_event({data, StreamId, BodyData, EndStream}, Data) ->
                     abort_h2_stream_too_large(
                         Ref, StreamId, ReqSt, NewBodySize, MaxSize, Data1
                     );
+                false when ReqSt#request_st.stream =/= undefined ->
+                    ok = stream_data(ReqSt, BodyData),
+                    Counted = ReqSt#request_st{body_size = NewBodySize},
+                    end_stream_on_fin(EndStream, Ref, StreamId, Counted, Data1);
                 false ->
                     NewBodyAcc = [BodyData | ReqSt#request_st.body_acc],
                     case EndStream of
@@ -1587,7 +1718,8 @@ do_cancel(Ref, AckFun, #conn_data{requests = Requests} = Data) ->
         undefined ->
             AckFun({error, not_found}),
             Data;
-        #request_st{stream_id = StreamId} ->
+        #request_st{stream_id = StreamId} = ReqSt ->
+            ok = stream_cancelled(ReqSt),
             Data1 = complete_request(Ref, StreamId, Data),
             case {Data#conn_data.protocol, StreamId} of
                 {http2, SId} when SId =/= undefined ->
@@ -1733,6 +1865,7 @@ complete_request(
 ) ->
     Data1 = demonitor_caller(Ref, Data),
     release_stream_slot(Data1),
+    ok = close_response_stream(maps:get(Ref, Requests, undefined), Data1),
     Data1#conn_data{
         requests = maps:remove(Ref, Requests),
         stream_index = maps:remove(StreamId, StreamIndex),
@@ -1778,15 +1911,16 @@ demonitor_caller(Ref, #conn_data{requests = Requests, caller_monitors = Mons} = 
             Data
     end.
 
+-doc "Answer every request with `Reason` and release the stream guard, ahead of the exit.".
 -spec fail_all_requests(#conn_data{}, term()) -> ok.
-fail_all_requests(#conn_data{self = Self, requests = Requests}, Reason) ->
+fail_all_requests(#conn_data{self = Self, requests = Requests} = Data, Reason) ->
     maps:foreach(
         fun(_Ref, ReqSt) ->
             send_response(ReqSt, {error, Reason}, Self)
         end,
         Requests
     ),
-    ok.
+    release_stream_guard(Data).
 
 -spec find_request_by_stream(nhttp_lib:stream_id(), #conn_data{}) ->
     {ok, reference(), #request_st{}} | error.
@@ -1988,6 +2122,9 @@ send_queue_report_due(ReportedAt, Now) ->
 -spec send_response(
     #request_st{}, {ok, nhttp_lib:response()} | {error, nhttpc_error:any_reason()}, pid()
 ) -> ok.
+send_response(#request_st{stream = #stream_st{}} = ReqSt, {error, Reason}, _Self) ->
+    {error, Public} = nhttpc_error:wrap(Reason),
+    last_stream_event(ReqSt, {error, Public});
 send_response(
     #request_st{stream_ref = StreamRef, caller_pid = CallerPid}, {ok, _} = Result, Self
 ) ->
@@ -2004,11 +2141,14 @@ proof of service rather than on a completed handshake. Every later
 response costs one match on the `served` flag and nothing else.
 """.
 -spec serve_response(#request_st{}, nhttp_lib:response(), #conn_data{}) -> #conn_data{}.
-serve_response(ReqSt, Resp, #conn_data{served = true, self = Self} = Data) ->
+serve_response(ReqSt, Resp, #conn_data{self = Self} = Data) ->
     ok = send_response(ReqSt, {ok, Resp}, Self),
+    mark_served(Data).
+
+-spec mark_served(#conn_data{}) -> #conn_data{}.
+mark_served(#conn_data{served = true} = Data) ->
     Data;
-serve_response(ReqSt, Resp, #conn_data{served = false, self = Self} = Data) ->
-    ok = send_response(ReqSt, {ok, Resp}, Self),
+mark_served(#conn_data{served = false} = Data) ->
     ok = notify_pool_served(Data),
     Data#conn_data{served = true}.
 
@@ -2064,6 +2204,137 @@ track_send_buffer(Data) ->
 -spec update_request(reference(), #request_st{}, #conn_data{}) -> #conn_data{}.
 update_request(Ref, ReqSt, #conn_data{requests = Requests} = Data) ->
     Data#conn_data{requests = Requests#{Ref => ReqSt}}.
+
+%%%-----------------------------------------------------------------------------
+%% RESPONSE STREAM
+%%%-----------------------------------------------------------------------------
+-spec close_response_stream(#request_st{} | undefined, #conn_data{}) -> ok.
+close_response_stream(
+    #request_st{stream = #stream_st{handle = Handle, pool = Pool}},
+    #conn_data{stream_guard = {Guard, _MRef}, self = Self}
+) ->
+    ok = nhttpc_stream_guard:closed(Guard, Handle),
+    pool_checkin(Pool, Self);
+close_response_stream(_ReqSt, _Data) ->
+    ok.
+
+-spec end_stream_on_fin(
+    nhttp_h2:fin(), reference(), nhttp_lib:stream_id(), #request_st{}, #conn_data{}
+) -> #conn_data{}.
+end_stream_on_fin(fin, Ref, StreamId, ReqSt, Data) ->
+    ok = last_stream_event(ReqSt, {done, normal}),
+    complete_request(Ref, StreamId, Data);
+end_stream_on_fin(nofin, Ref, _StreamId, ReqSt, Data) ->
+    update_request(Ref, ReqSt, Data).
+
+-spec ensure_stream_guard(#conn_data{}) -> #conn_data{}.
+ensure_stream_guard(#conn_data{stream_guard = undefined, self = Self} = Data) ->
+    {ok, Guard} = nhttpc_stream_guard:start(Self),
+    Data#conn_data{stream_guard = {Guard, erlang:monitor(process, Guard)}};
+ensure_stream_guard(Data) ->
+    Data.
+
+-spec handle_stream_guard_down(reference(), #conn_data{}) -> #conn_data{}.
+handle_stream_guard_down(MRef, #conn_data{stream_guard = {_Guard, MRef}} = Data) ->
+    Data1 = ensure_stream_guard(Data#conn_data{stream_guard = undefined}),
+    #conn_data{stream_guard = {Guard, _NewMRef}, requests = Requests} = Data1,
+    ok = maps:foreach(
+        fun(_Ref, ReqSt) -> guard_response_stream(Guard, ReqSt) end,
+        Requests
+    ),
+    Data1;
+handle_stream_guard_down(_MRef, Data) ->
+    Data.
+
+-spec guard_response_stream(pid(), #request_st{}) -> ok.
+guard_response_stream(Guard, #request_st{stream = #stream_st{handle = Handle}, stream_ref = Alias}) ->
+    nhttpc_stream_guard:opened(Guard, Handle, Alias);
+guard_response_stream(_Guard, #request_st{stream = undefined}) ->
+    ok.
+
+-spec open_response_stream(#request_st{}, #conn_data{}) -> #conn_data{}.
+open_response_stream(#request_st{stream = undefined}, Data) ->
+    Data;
+open_response_stream(
+    #request_st{
+        stream = #stream_st{advance = Advance},
+        stream_ref = Ref,
+        stream_id = StreamId,
+        caller_pid = Owner
+    } = ReqSt,
+    #conn_data{self = Self} = Data
+) ->
+    Data1 = #conn_data{stream_guard = {Guard, _MRef}} = ensure_stream_guard(Data),
+    ok = guard_response_stream(Guard, ReqSt),
+    Owner ! {nhttpc_stream_opened, Self, Ref},
+    hold_stream_credit(StreamId, Advance, Data1).
+
+-spec hold_stream_credit(nhttp_lib:stream_id(), non_neg_integer() | infinity, #conn_data{}) ->
+    #conn_data{}.
+hold_stream_credit(_StreamId, infinity, Data) ->
+    Data;
+hold_stream_credit(StreamId, Advance, #conn_data{h2_window = Window} = Data) ->
+    Data#conn_data{h2_window = nhttpc_h2_window:hold(StreamId, Advance, Window)}.
+
+-spec pool_checkin({pool, term()} | undefined, pid()) -> ok.
+pool_checkin(undefined, _Self) ->
+    ok;
+pool_checkin({pool, PoolRef}, Self) ->
+    nhttpc_pool:checkin_fast(PoolRef, Self).
+
+-spec release_stream_guard(#conn_data{}) -> ok.
+release_stream_guard(#conn_data{stream_guard = undefined}) ->
+    ok;
+release_stream_guard(#conn_data{stream_guard = {Guard, _MRef}}) ->
+    nhttpc_stream_guard:release(Guard).
+
+-spec stream_data(#request_st{}, binary()) -> ok.
+stream_data(_ReqSt, <<>>) ->
+    ok;
+stream_data(ReqSt, Chunk) ->
+    stream_event(ReqSt, {data, Chunk, more}).
+
+-doc """
+Send the last event of a response stream through the alias of its
+owner. The alias takes one message, so the owner gets one last event
+when this process and the guard both send one, and none after a cancel
+stopped the alias.
+""".
+-spec last_stream_event(#request_st{}, nhttpc:event()) -> ok.
+last_stream_event(#request_st{stream = #stream_st{handle = Handle}, stream_ref = Alias}, Event) ->
+    Alias ! {nhttpc, Handle, Event},
+    ok.
+
+-doc """
+Tell the owner that a cancel ended its stream. The owner that cancelled
+drops the event, and an owner that did not cancel learns that its
+stream is over.
+""".
+-spec stream_cancelled(#request_st{}) -> ok.
+stream_cancelled(#request_st{stream = #stream_st{}} = ReqSt) ->
+    {error, Reason} = nhttpc_error:stream_error(cancelled),
+    last_stream_event(ReqSt, {error, Reason});
+stream_cancelled(#request_st{stream = undefined}) ->
+    ok.
+
+-spec stream_event(#request_st{}, nhttpc:event()) -> ok.
+stream_event(#request_st{stream = #stream_st{handle = Handle}, caller_pid = Owner}, Event) ->
+    Owner ! {nhttpc, Handle, Event},
+    ok.
+
+-spec stream_mode(reference(), send_opts(), #conn_data{}) -> #stream_st{} | undefined.
+stream_mode(Ref, #{stream := StreamOpts}, #conn_data{self = Self}) ->
+    #stream_st{
+        handle = nhttpc_handle:new_shared(Self, Ref, stream),
+        advance = maps:get(consume_initial, StreamOpts, 0),
+        pool = stream_pool(StreamOpts)
+    };
+stream_mode(_Ref, _Opts, _Data) ->
+    undefined.
+
+-spec stream_pool(stream_opts()) -> {pool, term()} | undefined.
+stream_pool(#{pool := PoolRef}) -> {pool, PoolRef};
+stream_pool(_StreamOpts) -> undefined.
 
 %%%-----------------------------------------------------------------------------
 %% HTTP/1.1 HELPERS
@@ -2195,12 +2466,23 @@ on every stream, which no request would survive.
 -spec credit_peer(nhttp_lib:stream_id(), non_neg_integer(), nhttp_h2:fin(), #conn_data{}) ->
     #conn_data{}.
 credit_peer(StreamId, Octets, EndStream, #conn_data{h2_window = Window} = Data) ->
-    case nhttpc_h2_window:consume(StreamId, Octets, EndStream, Window) of
-        {[], Window1} ->
-            Data#conn_data{h2_window = Window1};
-        {Credits, Window1} ->
-            send_window_updates(Credits, Data#conn_data{h2_window = Window1})
+    return_credit(nhttpc_h2_window:consume(StreamId, Octets, EndStream, Window), Data).
+
+-spec handle_consume(reference(), pos_integer(), #conn_data{}) -> #conn_data{}.
+handle_consume(Ref, Octets, #conn_data{requests = Requests, h2_window = Window} = Data) ->
+    case Requests of
+        #{Ref := #request_st{stream_id = StreamId, stream = #stream_st{}}} ->
+            return_credit(nhttpc_h2_window:release(StreamId, Octets, Window), Data);
+        #{} ->
+            Data
     end.
+
+-spec return_credit({[nhttpc_h2_window:credit()], nhttpc_h2_window:t()}, #conn_data{}) ->
+    #conn_data{}.
+return_credit({[], Window}, Data) ->
+    Data#conn_data{h2_window = Window};
+return_credit({Credits, Window}, Data) ->
+    send_window_updates(Credits, Data#conn_data{h2_window = Window}).
 
 -spec send_window_updates([nhttpc_h2_window:credit()], #conn_data{}) -> #conn_data{}.
 send_window_updates(Credits, #conn_data{h2_conn = H2Conn0, socket = Socket} = Data) ->
@@ -2262,38 +2544,25 @@ start_idle_checker(
 %%%-----------------------------------------------------------------------------
 %% REQUEST TIMEOUT CHECKER
 %%%-----------------------------------------------------------------------------
+-doc """
+Answer every request whose deadline passed. Each one leaves through
+`complete_request/3`, so its stream slot and caller monitor go back.
+""".
 -spec handle_check_request_timeouts(#conn_data{}) -> #conn_data{}.
 handle_check_request_timeouts(#conn_data{requests = Requests} = Data) ->
     Now = erlang:monotonic_time(millisecond),
-    {Expired, Active} = maps:fold(
-        fun(Ref, #request_st{deadline = Deadline} = ReqSt, {ExpAcc, ActAcc}) ->
+    Expired = maps:fold(
+        fun(Ref, #request_st{deadline = Deadline} = ReqSt, Acc) ->
             case Deadline =/= undefined andalso Now >= Deadline of
-                true ->
-                    {[{Ref, ReqSt} | ExpAcc], ActAcc};
-                false ->
-                    {ExpAcc, ActAcc#{Ref => ReqSt}}
+                true -> [{Ref, ReqSt} | Acc];
+                false -> Acc
             end
         end,
-        {[], #{}},
+        [],
         Requests
     ),
-    Data1 = lists:foldl(
-        fun({_Ref, ReqSt}, AccData) ->
-            #request_st{stream_id = StreamId} = ReqSt,
-            send_response(ReqSt, timeout_reason(ReqSt, AccData), AccData#conn_data.self),
-            case {AccData#conn_data.protocol, StreamId} of
-                {http2, SId} when SId =/= undefined ->
-                    AccData1 = reset_h2_stream(SId, AccData),
-                    NewIndex = maps:remove(SId, AccData1#conn_data.stream_index),
-                    AccData1#conn_data{stream_index = NewIndex};
-                _ ->
-                    AccData
-            end
-        end,
-        Data#conn_data{requests = Active},
-        Expired
-    ),
-    case maps:size(Active) of
+    Data1 = lists:foldl(fun expire_request/2, Data, Expired),
+    case map_size(Data1#conn_data.requests) of
         0 ->
             stop_request_timeout_checker(Data1);
         _ ->
@@ -2301,6 +2570,15 @@ handle_check_request_timeouts(#conn_data{requests = Requests} = Data) ->
                 ?REQUEST_TIMEOUT_CHECK_INTERVAL, Data1#conn_data.self, check_request_timeouts
             ),
             maybe_report_send_queue(Data1#conn_data{request_timeout_check_ref = TimerRef})
+    end.
+
+-spec expire_request({reference(), #request_st{}}, #conn_data{}) -> #conn_data{}.
+expire_request({Ref, #request_st{stream_id = StreamId} = ReqSt}, #conn_data{self = Self} = Data) ->
+    ok = send_response(ReqSt, timeout_reason(ReqSt, Data), Self),
+    Data1 = complete_request(Ref, StreamId, Data),
+    case {Data1#conn_data.protocol, StreamId} of
+        {http2, SId} when SId =/= undefined -> reset_h2_stream(SId, Data1);
+        _ -> Data1
     end.
 
 -spec start_request_timeout_checker(#conn_data{}) -> #conn_data{}.
@@ -2429,27 +2707,6 @@ build_connect_opts(Opts) ->
         ]
     ),
     apply_tls_defaults(Transport, OptsWithUser).
-
--spec detect_protocol(nhttp_sock:t(), [nhttp_lib:version()]) -> nhttp_lib:version().
-detect_protocol(Socket, AllowedProtocols) ->
-    case nhttp_sock:negotiated_protocol(Socket) of
-        {ok, <<"h2">>} ->
-            case lists:member(http2, AllowedProtocols) of
-                true -> http2;
-                false -> http1_1
-            end;
-        {ok, <<"http/1.1">>} ->
-            http1_1;
-        {ok, <<"http/1.0">>} ->
-            http1_1;
-        {error, no_alpn} ->
-            case lists:member(http1_1, AllowedProtocols) of
-                true -> http1_1;
-                false -> http2
-            end;
-        _ ->
-            http1_1
-    end.
 
 -spec normalize_host(binary() | string() | inet:ip_address()) -> binary().
 normalize_host(Host) when is_binary(Host) -> Host;
