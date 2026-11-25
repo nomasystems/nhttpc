@@ -394,6 +394,32 @@ to the socket. An upload that reaches its request timeout with octets
 still held sends RST_STREAM and answers
 `{stream_error, {protocol, refused_stream}}`.
 
+`request/2` and `stream/2` take a file source and an iterator with
+`via => {pool, Ref}` and `via => {conn, Conn}` on HTTP/2. On that path:
+
+- The source runs in a process of its own, one for each request. An
+  iterator that waits for messages gets them in that process.
+- The connection asks for the next piece of the body when the peer
+  took the last one. A peer that gives no stream credit stops the
+  source: the connection holds 16384 octets at most past the stream
+  window, and the iterator is not called again.
+- An iterator that returns `{error, Reason}`, or that fails, resets the
+  stream with RST_STREAM and CANCEL. The answer is
+  `{body_error, {iterator, Reason}}`.
+- The end of the stream stops the source: a response that ends before
+  the body does, `cancel/1`, the exit of the owner, and the request
+  timeout, which is then `{timeout, request}`.
+- `stream/2` sends the response events while the source runs.
+- The request goes out one time. `retry` has no effect, and a redirect
+  is not followed.
+- `on_upload_progress` is not called.
+- Another protocol returns
+  `{invalid_request, stream_body_requires_http2}`.
+
+`stream/2` with `via => oneshot` takes an iodata body only. A file source
+or an iterator returns
+`{invalid_request, stream_body_requires_shared_connection}`.
+
 ## Cookie jar
 
 ```erlang
@@ -1289,6 +1315,8 @@ on a shared connection. Another protocol returns
 - `cancel/1` and the exit of the owner reset the stream. The connection
   stays open.
 - The body is not decompressed.
+- A `{stream, Source}` request body runs while the events arrive. See
+  the section on streaming uploads of the module documentation.
 """.
 -spec stream(nhttp_lib:request()) -> {ok, handle()} | {error, error()}.
 stream(Request) ->
@@ -1307,31 +1335,33 @@ stream(Request, Opts) ->
         end,
     nhttpc_error:wrap_result(Result).
 
--spec connection_stream_body(nhttp_lib:request()) -> ok | {error, error()}.
-connection_stream_body(Req) ->
-    case nhttpc_request:is_streaming_body(maps:get(body, Req, <<>>)) of
-        true -> nhttpc_error:invalid_request(stream_body_via_not_oneshot);
-        false -> ok
+-doc """
+A `oneshot` stream takes an iodata body. A `{stream, Source}` body needs
+a shared connection, which runs the source while the events arrive.
+""".
+-spec oneshot_stream_body(term()) -> ok | {error, error()}.
+oneshot_stream_body(Body) ->
+    case {nhttpc_request:is_streaming_body(Body), nhttpc_h2:measure_body(Body)} of
+        {true, _NotIodata} -> nhttpc_error:invalid_request(stream_body_requires_shared_connection);
+        {false, {ok, _Size}} -> ok;
+        {false, {error, invalid_body}} -> nhttpc_error:invalid_request(invalid_body)
     end.
 
 -spec start_stream(via(), nhttp_lib:request(), nhttpc_url:http_url_info(), opts()) ->
     {ok, handle()} | {error, nhttpc_error:any_reason()}.
 start_stream(oneshot, Req, UrlInfo, Opts) ->
-    nhttpc_stream_worker:start(self(), Req, UrlInfo, Opts);
+    maybe
+        ok ?= oneshot_stream_body(maps:get(body, Req, <<>>)),
+        nhttpc_stream_worker:start(self(), Req, UrlInfo, Opts)
+    end;
 start_stream({pool, PoolRef}, Req, _UrlInfo, Opts) ->
-    maybe
-        ok ?= connection_stream_body(Req),
-        nhttpc_pool:stream(
-            PoolRef, Req, nhttpc_opts:timeout(request, Opts), stream_send_opts(Opts)
-        )
-    end;
+    nhttpc_request:open_shared_stream(
+        {pool, PoolRef}, Req, nhttpc_opts:timeout(request, Opts), stream_send_opts(Opts)
+    );
 start_stream({conn, #{pid := ConnPid, version := http2}}, Req, _UrlInfo, Opts) ->
-    maybe
-        ok ?= connection_stream_body(Req),
-        nhttpc_conn:open_stream(
-            ConnPid, Req, stream_send_opts(Opts), nhttpc_opts:timeout(request, Opts)
-        )
-    end;
+    nhttpc_request:open_shared_stream(
+        {conn, ConnPid}, Req, nhttpc_opts:timeout(request, Opts), stream_send_opts(Opts)
+    );
 start_stream({conn, #{version := _NotHttp2}}, _Req, _UrlInfo, _Opts) ->
     nhttpc_error:invalid_opts(stream_requires_http2);
 start_stream(_Via, _Req, _UrlInfo, _Opts) ->

@@ -17,10 +17,11 @@ whatever `response_body` says. `/frames/N/S` is answered with `N` DATA
 frames of `S` octets each, as the windows of the client allow.
 `/reset/Code` is answered with RST_STREAM and that error code. `/manual`
 is answered by the test alone, with the `headers`, `data` and
-`rst_stream` commands.
+`rst_stream` commands. `/mirror` is answered with a 200 when the request
+opens and with each DATA payload of the request as it arrives.
 
 Every connection records what the client did: the streams it opened, the
-request octets it sent, the DATA frames it sent and the largest of them,
+request octets it sent, in all and on each stream, the DATA frames it sent and the largest of them,
 the streams it reset, every WINDOW_UPDATE increment it returned, per
 stream and on the connection, and the octets the peer sent it. That is
 what the flow-control conformance cases assert on. A connection whose
@@ -87,6 +88,7 @@ GOAWAY with a chosen last stream id, and credits on read. This peer can.
     responses := non_neg_integer(),
     streams := [nhttp_lib:stream_id()],
     data_octets := non_neg_integer(),
+    request_octets_streams := #{nhttp_lib:stream_id() => non_neg_integer()},
     data_octets_while_zero := non_neg_integer(),
     data_frames := #{nhttp_lib:stream_id() => non_neg_integer()},
     max_data_frame := non_neg_integer(),
@@ -120,6 +122,7 @@ GOAWAY with a chosen last stream id, and credits on read. This peer can.
 -type answer() ::
     undefined
     | manual
+    | echo
     | {body, non_neg_integer()}
     | {frames, non_neg_integer(), pos_integer()}
     | {reset, nhttp_h2:error_code()}.
@@ -136,7 +139,7 @@ GOAWAY with a chosen last stream id, and credits on read. This peer can.
     opts :: opts(),
     credit :: credit_policy(),
     consumed = 0 :: non_neg_integer(),
-    consumed_streams = #{} :: #{nhttp_lib:stream_id() => pos_integer()},
+    consumed_streams = #{} :: #{nhttp_lib:stream_id() => non_neg_integer()},
     streams = #{} :: #{nhttp_lib:stream_id() => #stream{}},
     zero_window = false :: boolean(),
     tick_ref = undefined :: undefined | reference(),
@@ -303,6 +306,7 @@ new_stats() ->
         responses => 0,
         streams => [],
         data_octets => 0,
+        request_octets_streams => #{},
         data_octets_while_zero => 0,
         data_frames => #{},
         max_data_frame => 0,
@@ -370,10 +374,11 @@ on_event({request, StreamId, Request, Fin}, #conn{stats = Stats, streams = Strea
         streams = Streams#{StreamId => #stream{answer = path_answer(Request)}},
         stats = Stats#{requests => Requests + 1, streams => [StreamId | Seen]}
     },
-    maybe_schedule(StreamId, Fin, Conn1);
+    open_answer(StreamId, Fin, Conn1);
 on_event({data, StreamId, Payload, Fin}, #conn{stats = Stats, consumed = Consumed} = Conn) ->
     Size = byte_size(Payload),
-    #{data_octets := Octets, data_octets_while_zero := Zero} = Stats,
+    #{data_octets := Octets, data_octets_while_zero := Zero, request_octets_streams := PerStream} =
+        Stats,
     ConsumedStreams = Conn#conn.consumed_streams,
     Conn1 = Conn#conn{
         consumed = Consumed + Size,
@@ -382,10 +387,13 @@ on_event({data, StreamId, Payload, Fin}, #conn{stats = Stats, consumed = Consume
         },
         stats = Stats#{
             data_octets => Octets + Size,
+            request_octets_streams => PerStream#{
+                StreamId => maps:get(StreamId, PerStream, 0) + Size
+            },
             data_octets_while_zero => Zero + while_zero(Conn#conn.zero_window, Size)
         }
     },
-    maybe_schedule(StreamId, Fin, Conn1);
+    data_answer(StreamId, Payload, Fin, Conn1);
 on_event({window_update, 0, Increment}, #conn{stats = Stats} = Conn) ->
     #{client_credit_conn := Credit, sent_octets_conn := Sent, max_conn_window := Max} = Stats,
     NewCredit = Credit + Increment,
@@ -435,6 +443,27 @@ on_event({ping, _Data}, Conn) ->
     Conn;
 on_event({ping_ack, _Data}, #conn{stats = #{ping_acks := Acks} = Stats} = Conn) ->
     Conn#conn{stats = Stats#{ping_acks => Acks + 1}}.
+
+-spec open_answer(nhttp_lib:stream_id(), nhttp_h2:fin(), #conn{}) -> #conn{}.
+open_answer(StreamId, Fin, #conn{streams = Streams} = Conn) ->
+    case Streams of
+        #{StreamId := #stream{answer = echo}} ->
+            Headers = [{<<":status">>, <<"200">>}],
+            echo(StreamId, <<>>, Fin, send_headers(StreamId, Headers, nofin, Conn));
+        #{} ->
+            maybe_schedule(StreamId, Fin, Conn)
+    end.
+
+-spec data_answer(nhttp_lib:stream_id(), binary(), nhttp_h2:fin(), #conn{}) -> #conn{}.
+data_answer(StreamId, Payload, Fin, #conn{streams = Streams} = Conn) ->
+    case Streams of
+        #{StreamId := #stream{answer = echo}} -> echo(StreamId, Payload, Fin, Conn);
+        #{} -> maybe_schedule(StreamId, Fin, Conn)
+    end.
+
+-spec echo(nhttp_lib:stream_id(), binary(), nhttp_h2:fin(), #conn{}) -> #conn{}.
+echo(_StreamId, <<>>, nofin, Conn) -> Conn;
+echo(StreamId, Payload, Fin, Conn) -> send_data(StreamId, Payload, Fin, Conn).
 
 -spec while_zero(boolean(), non_neg_integer()) -> non_neg_integer().
 while_zero(true, Size) -> Size;
@@ -666,7 +695,9 @@ start_tick(_IntervalMs, #conn{tick_ref = Ref} = Conn) when Ref =/= undefined ->
 start_tick(IntervalMs, Conn) ->
     Conn#conn{tick_ref = erlang:start_timer(IntervalMs, self(), tick)}.
 
--spec credit_stream(nhttp_lib:stream_id(), pos_integer(), #conn{}) -> #conn{}.
+-spec credit_stream(nhttp_lib:stream_id(), non_neg_integer(), #conn{}) -> #conn{}.
+credit_stream(_StreamId, 0, Conn) ->
+    Conn;
 credit_stream(StreamId, Octets, #conn{h2 = H2, out = Out} = Conn) ->
     case nhttp_h2:send_window_update(H2, StreamId, Octets) of
         {ok, H2b, Frame} -> Conn#conn{h2 = H2b, out = [Out, Frame]};
@@ -734,6 +765,8 @@ path_answer(#{path := <<"/reset/", Code/binary>>}) ->
     {reset, binary_to_existing_atom(Code)};
 path_answer(#{path := <<"/manual">>}) ->
     manual;
+path_answer(#{path := <<"/mirror">>}) ->
+    echo;
 path_answer(_Request) ->
     undefined.
 

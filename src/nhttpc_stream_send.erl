@@ -22,6 +22,7 @@ seen. Progress reports the octets written to the socket.
 -export([
     do_h3_streaming_upload/4,
     do_streaming_upload/5,
+    prepare_stream_source/2,
     send_h2_body/5
 ]).
 
@@ -152,7 +153,11 @@ make_file_iterator(Fd, ChunkSize) ->
         end
     end.
 
--doc "Convert file source to iterator if needed.".
+-doc """
+The iterator of a stream source and the size of the body when it is
+known. A file source is opened by the caller, and the caller is the one
+process that can read it.
+""".
 -spec prepare_stream_source(stream_source(), stream_body_opts()) ->
     {ok, stream_iterator(), non_neg_integer() | unknown} | {error, nhttpc_error:any_reason()}.
 prepare_stream_source({file, FilePath}, Opts) ->

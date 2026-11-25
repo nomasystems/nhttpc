@@ -29,6 +29,7 @@ This module handles:
     h1_parse_opts/1,
     is_streaming_body/1,
     maybe_add_accept_encoding/2,
+    open_shared_stream/4,
 
     recv_h2_settings/3
 ]).
@@ -60,16 +61,11 @@ genuinely empty body and would drag the low percentiles of the size
 histogram down.
 """.
 -spec body_length(term()) -> non_neg_integer() | undefined.
-body_length(Body) when is_binary(Body) ->
-    byte_size(Body);
-body_length(Body) when is_list(Body) ->
-    try
-        iolist_size(Body)
-    catch
-        _:_ -> undefined
-    end;
-body_length(_Other) ->
-    undefined.
+body_length(Body) ->
+    case nhttpc_h2:measure_body(Body) of
+        {ok, Size} -> Size;
+        {error, invalid_body} -> undefined
+    end.
 
 -spec body_measurements(non_neg_integer() | undefined, non_neg_integer() | undefined) -> map().
 body_measurements(ReqBodyLength, RespBodyLength) ->
@@ -101,7 +97,7 @@ do_request_instrumented(Req, UrlInfo, Opts, Method, TelemetryConfig) ->
     ReqBodyLength = body_length(maps:get(body, Req, <<>>)),
     TelemetryMeta = telemetry_meta(Method, UrlInfo, Opts),
     StartTime = nhttpc_telemetry:client_request_start(TelemetryConfig, TelemetryMeta),
-    RetryOpts = nhttpc_retry:normalize_opts(maps:get(retry, Opts, false), Method),
+    RetryOpts = retry_opts(Req, Opts, Method),
     try
         Result = do_request_with_retry(Req, UrlInfo, Opts, RetryOpts, 1),
         emit_request_end(TelemetryConfig, StartTime, TelemetryMeta, ReqBodyLength, Result),
@@ -123,8 +119,30 @@ do_request_instrumented(Req, UrlInfo, Opts, Method, TelemetryConfig) ->
 ) ->
     {ok, nhttp_lib:response()} | {error, nhttpc_error:any_reason()}.
 do_request_uninstrumented(Req, UrlInfo, Opts, Method) ->
-    RetryOpts = nhttpc_retry:normalize_opts(maps:get(retry, Opts, false), Method),
+    RetryOpts = retry_opts(Req, Opts, Method),
     do_request_with_retry(Req, UrlInfo, Opts, RetryOpts, 1).
+
+-doc """
+The retry options of a request. A request that goes out one time only
+has none.
+""".
+-spec retry_opts(nhttp_lib:request(), nhttpc:opts(), nhttp_lib:method()) ->
+    false | nhttpc_retry:retry_opts().
+retry_opts(Req, Opts, Method) ->
+    case sent_once(Req, Opts) of
+        true -> false;
+        false -> nhttpc_retry:normalize_opts(maps:get(retry, Opts, false), Method)
+    end.
+
+-doc """
+Whether the request goes out one time only. The source of a streaming
+body on a shared connection runs in a process of its own and does not
+start again, so such a request has no retry and follows no redirect.
+""".
+-spec sent_once(nhttp_lib:request(), nhttpc:opts()) -> boolean().
+sent_once(Req, Opts) ->
+    maps:get(via, Opts, oneshot) =/= oneshot andalso
+        is_streaming_body(maps:get(body, Req, <<>>)).
 
 -doc "Emit request end telemetry event.".
 -spec emit_request_end(
@@ -324,7 +342,7 @@ check_redirect_policy(Status, Location, Req, Opts) ->
 -spec do_request_inner(nhttp_lib:request(), nhttpc_url:http_url_info(), nhttpc:opts()) ->
     {ok, nhttp_lib:response()} | {error, nhttpc_error:any_reason()}.
 do_request_inner(Req, UrlInfo, Opts) ->
-    FollowRedirects = maps:get(follow_redirects, Opts, true),
+    FollowRedirects = maps:get(follow_redirects, Opts, true) andalso not sent_once(Req, Opts),
     case FollowRedirects of
         true ->
             do_request_with_redirects(Req, UrlInfo, Opts, [], 0);
@@ -659,11 +677,16 @@ do_pooled_request(Req, UrlInfo, PoolRef, Opts) when is_map(UrlInfo) ->
     MaxRespSize = maps:get(max_response_size, Opts, ?DEFAULT_MAX_RESPONSE_SIZE),
     MaxHeaderSize = maps:get(max_header_size, Opts, ?DEFAULT_MAX_HEADER_SIZE),
     MaxHeadersCount = maps:get(max_headers_count, Opts, ?DEFAULT_MAX_HEADERS_COUNT),
-    nhttpc_pool:request(PoolRef, Req, Timeout, #{
-        max_response_size => MaxRespSize,
-        max_header_size => MaxHeaderSize,
-        max_headers_count => MaxHeadersCount
-    }).
+    case is_streaming_body(maps:get(body, Req, <<>>)) of
+        false ->
+            nhttpc_pool:request(PoolRef, Req, Timeout, #{
+                max_response_size => MaxRespSize,
+                max_header_size => MaxHeaderSize,
+                max_headers_count => MaxHeadersCount
+            });
+        true ->
+            request_on_stream({pool, PoolRef}, Req, Timeout, MaxRespSize)
+    end.
 
 -spec do_poolless_h3_exchange(
     nhttp_lib:request(),
@@ -767,6 +790,8 @@ normalize_tls_map(Tls) ->
 tcp_transport(ssl) -> ssl;
 tcp_transport(_) -> tcp.
 
+-type shared_via() :: {pool, term()} | {conn, pid()}.
+
 -type body_sink() ::
     none
     | {file, file:filename()}
@@ -803,8 +828,88 @@ body_sink(_) ->
 do_conn_request(Req, Conn, Opts) ->
     Timeout = nhttpc_opts:timeout(request, Opts),
     ConnPid = nhttpc:conn_pid(Conn),
-    {ok, StreamRef} = nhttpc_conn:send_async(ConnPid, Req, self()),
-    await_conn_response(ConnPid, StreamRef, Timeout).
+    case is_streaming_body(maps:get(body, Req, <<>>)) of
+        false ->
+            {ok, StreamRef} = nhttpc_conn:send_async(ConnPid, Req, self()),
+            await_conn_response(ConnPid, StreamRef, Timeout);
+        true ->
+            MaxRespSize = maps:get(max_response_size, Opts, ?DEFAULT_MAX_RESPONSE_SIZE),
+            request_on_stream({conn, ConnPid}, Req, Timeout, MaxRespSize)
+    end.
+
+-doc """
+Open one stream on a shared HTTP/2 connection. A `{stream, Source}`
+body gets its upload process here, and a stream that does not open
+stops that process.
+""".
+-spec open_shared_stream(shared_via(), map(), timeout(), nhttpc_conn:send_opts()) ->
+    {ok, nhttpc:handle()} | {error, nhttpc_error:any_reason()}.
+open_shared_stream(Via, Req, Timeout, SendOpts) ->
+    maybe
+        {ok, Bodiless, UploadOpts} ?= nhttpc_upload:attach(Req, SendOpts),
+        Result = dispatch_stream(Via, Bodiless, Timeout, UploadOpts),
+        ok = nhttpc_upload:release(Result, UploadOpts),
+        Result
+    end.
+
+-spec dispatch_stream(shared_via(), nhttp_lib:request(), timeout(), nhttpc_conn:send_opts()) ->
+    {ok, nhttpc:handle()} | {error, nhttpc_error:any_reason()}.
+dispatch_stream({pool, PoolRef}, Req, Timeout, SendOpts) ->
+    nhttpc_pool:stream(PoolRef, Req, Timeout, SendOpts);
+dispatch_stream({conn, ConnPid}, Req, Timeout, SendOpts) ->
+    nhttpc_conn:open_stream(ConnPid, Req, SendOpts, Timeout).
+
+-doc """
+Send a request with a `{stream, Source}` body on a shared HTTP/2
+connection and collect the response. The request runs as a stream with
+the caller as its owner, because a stream opens before its source
+starts: a stream that the connection refuses goes to another connection
+with a source that did not run.
+""".
+-spec request_on_stream(shared_via(), map(), timeout(), pos_integer() | infinity) ->
+    {ok, nhttp_lib:response()} | {error, nhttpc_error:any_reason()}.
+request_on_stream(Via, Req, Timeout, MaxResponseSize) ->
+    Deadline = stream_deadline(Timeout),
+    SendOpts = #{
+        max_response_size => MaxResponseSize,
+        request_deadline => Deadline,
+        stream => #{consume_initial => infinity}
+    },
+    maybe
+        {ok, Handle} ?= open_shared_stream(Via, Req, Timeout, SendOpts),
+        await_stream_response(Handle, Timeout, Deadline, #{}, [])
+    end.
+
+-spec await_stream_response(
+    nhttpc:handle(), timeout(), integer() | infinity, map(), [binary()]
+) ->
+    {ok, nhttp_lib:response()} | {error, nhttpc_error:any_reason()}.
+await_stream_response(Handle, Timeout, Deadline, Resp, Acc) ->
+    receive
+        {nhttpc, Handle, {headers, Status, Headers}} ->
+            Head = Resp#{status => Status, headers => Headers},
+            await_stream_response(Handle, Timeout, Deadline, Head, Acc);
+        {nhttpc, Handle, {data, Chunk, more}} ->
+            await_stream_response(Handle, Timeout, Deadline, Resp, [Chunk | Acc]);
+        {nhttpc, Handle, {trailers, Trailers}} ->
+            Trailed = Resp#{trailers => Trailers},
+            await_stream_response(Handle, Timeout, Deadline, Trailed, Acc);
+        {nhttpc, Handle, {done, normal}} ->
+            {ok, Resp#{body => iolist_to_binary(lists:reverse(Acc))}};
+        {nhttpc, Handle, {error, Reason}} ->
+            {error, Reason}
+    after time_left(Deadline) ->
+        ok = nhttpc:cancel(Handle),
+        nhttp_error:request_timeout(Timeout)
+    end.
+
+-spec stream_deadline(timeout()) -> integer() | infinity.
+stream_deadline(infinity) -> infinity;
+stream_deadline(Timeout) -> erlang:monotonic_time(millisecond) + Timeout.
+
+-spec time_left(integer() | infinity) -> timeout().
+time_left(infinity) -> infinity;
+time_left(Deadline) -> max(0, Deadline - erlang:monotonic_time(millisecond)).
 
 -spec do_poolless_tcp_exchange(
     nhttp_lib:request(),

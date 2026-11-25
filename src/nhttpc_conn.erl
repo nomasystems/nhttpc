@@ -59,6 +59,20 @@ as `{nhttpc, Handle, Event}`. The stream window is credited from
 `nhttpc:consume/2` and the connection window on arrival
 (`nhttpc_h2_window`). `nhttpc_stream_guard` covers an exit of this
 process with no last event.
+
+## Request body from a source
+
+A stream whose options carry `upload` has no body in its request. The
+HEADERS frame goes out without END_STREAM, and the process asks the
+upload process (`nhttpc_upload`) for one piece at a time, of
+16384 octets at most. It asks for the next piece only when the
+codec holds no octet of the stream, so a stream that the peer does not
+credit keeps one piece at most in the send queue and the source stops.
+A piece that the send queue refuses, because it is full, stays in the
+process until the queue has room. The checkout claims no send credit for
+such a request: the octets are taken from the credit slot as they
+leave. The request is not sent again, so a timeout of it is a plain
+timeout.
 """.
 
 -include("nhttpc.hrl").
@@ -120,11 +134,15 @@ process with no last event.
 -doc """
 `consume_initial`: stream credit returned on arrival, ahead of
 `nhttpc:consume/2`. `pool`: the pool to tell when the stream ends.
+`upload`: the process that runs the source of the request body.
 """.
 -type stream_opts() :: #{
     consume_initial => non_neg_integer() | infinity,
-    pool => term()
+    pool => term(),
+    upload => pid()
 }.
+
+-type h2_body() :: {iodata, iodata(), non_neg_integer()} | {upload, pid()}.
 
 -type h1_mode() :: ready | draining.
 
@@ -170,6 +188,7 @@ process with no last event.
 -define(CREDIT_REPORT_INTERVAL_US, 1_000_000).
 -define(SEND_QUEUE_REPORT_INTERVAL_MS, 1000).
 -define(CONNECTION_STREAM_ID, 0).
+-define(UPLOAD_PIECE, 16384).
 
 %%%-----------------------------------------------------------------------------
 %% RECORDS
@@ -184,10 +203,17 @@ process with no last event.
     reported_at :: integer() | undefined
 }).
 
+-record(upload_st, {
+    feeder :: pid(),
+    mref :: reference(),
+    held = undefined :: binary() | undefined
+}).
+
 -record(stream_st, {
     handle :: nhttpc:handle(),
     advance :: non_neg_integer() | infinity,
-    pool :: {pool, term()} | undefined
+    pool :: {pool, term()} | undefined,
+    upload = undefined :: #upload_st{} | undefined
 }).
 
 -record(request_st, {
@@ -257,7 +283,8 @@ process with no last event.
     max_streams_per_connection :: pos_integer(),
     rotating = false :: boolean(),
     drain_grace_ref = undefined :: reference() | undefined,
-    stream_guard = undefined :: {pid(), reference()} | undefined
+    stream_guard = undefined :: {pid(), reference()} | undefined,
+    held_uploads = [] :: [reference()]
 }).
 
 %%%-----------------------------------------------------------------------------
@@ -749,6 +776,8 @@ ready_loop(#conn_data{parent = Parent} = Data) ->
             ready_loop(Data1);
         {'$nhttpc_consume', Ref, Octets} ->
             ready_loop(handle_consume(Ref, Octets, Data));
+        {'$nhttpc_upload', Ref, Piece} ->
+            ready_loop(handle_upload(Ref, Piece, Data));
         {'$call', From, wait_ready} ->
             reply(From, ok),
             ready_loop(Data);
@@ -758,12 +787,12 @@ ready_loop(#conn_data{parent = Parent} = Data) ->
         {'$call', From, ping} ->
             Data1 = handle_ping(From, Data),
             ready_loop(Data1);
-        {'DOWN', MRef, process, _Pid, _Reason} ->
+        {'DOWN', MRef, process, _Pid, Reason} ->
             case maps:get(MRef, Data#conn_data.caller_monitors, undefined) of
                 undefined ->
                     ready_loop(handle_stream_guard_down(MRef, Data));
                 StreamRef ->
-                    ready_loop(handle_caller_down(StreamRef, Data))
+                    ready_loop(handle_monitor_down(MRef, StreamRef, Reason, Data))
             end;
         {stop, _From} ->
             nhttp_sock:close(Data#conn_data.socket),
@@ -812,18 +841,20 @@ draining_loop(#conn_data{parent = Parent} = Data) ->
             draining_loop(Data1);
         {'$nhttpc_consume', Ref, Octets} ->
             draining_loop(handle_consume(Ref, Octets, Data));
+        {'$nhttpc_upload', Ref, Piece} ->
+            exit_when_drained(handle_upload(Ref, Piece, Data));
         {'$call', From, wait_ready} ->
             reply(From, {error, draining}),
             draining_loop(Data);
         {'$call', From, ping} ->
             reply(From, {error, draining}),
             draining_loop(Data);
-        {'DOWN', MRef, process, _Pid, _Reason} ->
+        {'DOWN', MRef, process, _Pid, Reason} ->
             case maps:get(MRef, Data#conn_data.caller_monitors, undefined) of
                 undefined ->
                     draining_loop(handle_stream_guard_down(MRef, Data));
                 StreamRef ->
-                    exit_when_drained(handle_caller_down(StreamRef, Data))
+                    exit_when_drained(handle_monitor_down(MRef, StreamRef, Reason, Data))
             end;
         drain_grace ->
             exit(normal);
@@ -960,12 +991,31 @@ half-encoded request into the connection.
     reference(), nhttp_lib:request(), pid(), send_opts(), nhttp_lib:stream_id(), #conn_data{}
 ) ->
     {ok, iodata(), #conn_data{}} | {error, term()}.
+encode_h2_stream(StreamRef, Request, CallerPid, Opts, StreamId, Data) ->
+    case h2_body(Request, Opts) of
+        {ok, Body} ->
+            encode_h2_stream(StreamRef, Request, CallerPid, Opts, StreamId, Body, Data);
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+-spec encode_h2_stream(
+    reference(),
+    nhttp_lib:request(),
+    pid(),
+    send_opts(),
+    nhttp_lib:stream_id(),
+    h2_body(),
+    #conn_data{}
+) ->
+    {ok, iodata(), #conn_data{}} | {error, term()}.
 encode_h2_stream(
     StreamRef,
     Request,
     CallerPid,
     Opts,
     StreamId,
+    Body,
     #conn_data{
         h2_conn = H2Conn1,
         h2_scheme = Scheme,
@@ -973,13 +1023,6 @@ encode_h2_stream(
     } = Data
 ) ->
     Headers = nhttpc_h2:request_to_h2_headers(Request, Scheme, Authority),
-    Body = maps:get(body, Request, <<>>),
-    BodySize = iolist_size(Body),
-    EndStream =
-        case BodySize of
-            0 -> fin;
-            _ -> nofin
-        end,
     MRef = erlang:monitor(process, CallerPid),
     ReqSt = #request_st{
         stream = stream_mode(StreamRef, Opts, Data),
@@ -991,16 +1034,11 @@ encode_h2_stream(
         deadline = request_deadline(Opts, Data),
         max_response_size = max_response_size(Opts)
     },
-    case nhttp_h2:send_headers(H2Conn1, StreamId, Headers, EndStream) of
-        {ok, H2Conn2, HeaderFrame} when BodySize =:= 0 ->
-            {ok, HeaderFrame, register_h2_request(ReqSt, H2Conn2, Data)};
+    case nhttp_h2:send_headers(H2Conn1, StreamId, Headers, h2_headers_fin(Body)) of
         {ok, H2Conn2, HeaderFrame} ->
-            case offer_h2_body(Request, Body, BodySize, StreamId, H2Conn2, Data) of
-                {ok, H2Conn3, DataFrames, Buffered} ->
-                    Pending = ReqSt#request_st{body_pending = Buffered > 0},
-                    Data1 = register_h2_request(Pending, H2Conn3, Data),
-                    ok = settle_credit_claim(Request, BodySize - Buffered, Data1),
-                    {ok, [HeaderFrame, DataFrames], Data1};
+            case encode_h2_body(Body, HeaderFrame, ReqSt, H2Conn2, Data) of
+                {ok, Frames, Data1} ->
+                    {ok, Frames, Data1};
                 {error, Reason} ->
                     erlang:demonitor(MRef, [flush]),
                     {error, Reason}
@@ -1009,6 +1047,52 @@ encode_h2_stream(
             erlang:demonitor(MRef, [flush]),
             {error, {http2_error, Reason}}
     end.
+
+-doc """
+Encode what follows the HEADERS frame of a request and register the
+request. A body from a source registers with nothing sent, and its
+first piece is asked for.
+""".
+-spec encode_h2_body(h2_body(), iodata(), #request_st{}, nhttp_h2:conn(), #conn_data{}) ->
+    {ok, iodata(), #conn_data{}} | {error, term()}.
+encode_h2_body({iodata, _Body, 0}, HeaderFrame, ReqSt, H2Conn, Data) ->
+    {ok, HeaderFrame, register_h2_request(ReqSt, H2Conn, Data)};
+encode_h2_body({iodata, Body, BodySize}, HeaderFrame, ReqSt, H2Conn, Data) ->
+    #request_st{request = Request, stream_id = StreamId} = ReqSt,
+    case offer_h2_body(Request, Body, BodySize, StreamId, H2Conn, Data) of
+        {ok, H2Conn1, DataFrames, Buffered} ->
+            Pending = ReqSt#request_st{body_pending = Buffered > 0},
+            Data1 = register_h2_request(Pending, H2Conn1, Data),
+            ok = settle_credit_claim(Request, BodySize - Buffered, Data1),
+            {ok, [HeaderFrame, DataFrames], Data1};
+        {error, Reason} ->
+            {error, Reason}
+    end;
+encode_h2_body({upload, Feeder}, HeaderFrame, ReqSt, H2Conn, Data) ->
+    Uploading = open_upload(Feeder, ReqSt),
+    Data1 = watch_upload(Uploading, register_h2_request(Uploading, H2Conn, Data)),
+    ok = demand_upload(Uploading, Data1),
+    {ok, HeaderFrame, Data1}.
+
+-doc """
+The body of a request on HTTP/2: iodata with its size, or the process
+that runs its source. A body that is neither is refused here, so that
+no body shape stops the connection.
+""".
+-spec h2_body(nhttp_lib:request(), send_opts()) -> {ok, h2_body()} | {error, term()}.
+h2_body(_Request, #{stream := #{upload := Feeder}}) ->
+    {ok, {upload, Feeder}};
+h2_body(Request, _Opts) ->
+    Body = maps:get(body, Request, <<>>),
+    case nhttpc_h2:measure_body(Body) of
+        {ok, BodySize} -> {ok, {iodata, Body, BodySize}};
+        {error, invalid_body} -> nhttpc_error:invalid_request(invalid_body)
+    end.
+
+-spec h2_headers_fin(h2_body()) -> nhttp_h2:fin().
+h2_headers_fin({iodata, _Body, 0}) -> fin;
+h2_headers_fin({iodata, _Body, _BodySize}) -> nofin;
+h2_headers_fin({upload, _Feeder}) -> nofin.
 
 -spec h1_parse_opts(send_opts()) -> nhttp_h1:opts().
 h1_parse_opts(Opts) ->
@@ -1060,10 +1144,25 @@ offer_h2_body(Request, Body, BodySize, StreamId, H2Conn, Data) ->
 
 -spec process_h1_single(reference(), nhttp_lib:request(), pid(), send_opts(), #conn_data{}) ->
     #conn_data{}.
+process_h1_single(StreamRef, _Request, CallerPid, #{stream := #{upload := _}}, Data) ->
+    Reason = {invalid_request, stream_body_requires_http2},
+    ok = reject_send(StreamRef, CallerPid, Reason, 0, Data),
+    Data;
 process_h1_single(StreamRef, _Request, CallerPid, #{stream := _}, Data) ->
     ok = reject_send(StreamRef, CallerPid, {invalid_opts, stream_requires_http2}, 0, Data),
     Data;
-process_h1_single(
+process_h1_single(StreamRef, Request, CallerPid, Opts, Data) ->
+    case nhttpc_h2:measure_body(maps:get(body, Request, <<>>)) of
+        {ok, _BodySize} ->
+            encode_h1_single(StreamRef, Request, CallerPid, Opts, Data);
+        {error, invalid_body} ->
+            ok = reject_send(StreamRef, CallerPid, {invalid_request, invalid_body}, 0, Data),
+            Data
+    end.
+
+-spec encode_h1_single(reference(), nhttp_lib:request(), pid(), send_opts(), #conn_data{}) ->
+    #conn_data{}.
+encode_h1_single(
     StreamRef, Request, CallerPid, Opts, #conn_data{requests = Requests} = Data
 ) ->
     MRef = erlang:monitor(process, CallerPid),
@@ -1626,7 +1725,10 @@ process_h2_event({data_sent, StreamId, Bytes, EndStream}, Data) ->
             update_request(Ref, ReqSt#request_st{body_pending = false}, Data);
         {fin, error} ->
             Data;
-        {nofin, _} ->
+        {nofin, {ok, _Ref, ReqSt}} ->
+            ok = demand_upload(ReqSt, Data),
+            Data;
+        {nofin, error} ->
             Data
     end;
 process_h2_event({stream_closed, _StreamId, _ErrorCode}, Data) ->
@@ -1640,7 +1742,7 @@ process_h2_event({ping, _OpaqueData}, Data) ->
 
 -spec process_h2_events([nhttp_h2:event()], #conn_data{}) -> #conn_data{}.
 process_h2_events([], Data) ->
-    track_send_buffer(Data);
+    track_send_buffer(resume_uploads(Data));
 process_h2_events([Event | Rest], Data) ->
     NewData = process_h2_event(Event, Data),
     process_h2_events(Rest, NewData).
@@ -1865,8 +1967,10 @@ complete_request(
 ) ->
     Data1 = demonitor_caller(Ref, Data),
     release_stream_slot(Data1),
-    ok = close_response_stream(maps:get(Ref, Requests, undefined), Data1),
-    Data1#conn_data{
+    ReqSt = maps:get(Ref, Requests, undefined),
+    ok = close_response_stream(ReqSt, Data1),
+    Data2 = stop_upload(ReqSt, Data1),
+    Data2#conn_data{
         requests = maps:remove(Ref, Requests),
         stream_index = maps:remove(StreamId, StreamIndex),
         h2_window = nhttpc_h2_window:forget(StreamId, Window)
@@ -1911,12 +2015,16 @@ demonitor_caller(Ref, #conn_data{requests = Requests, caller_monitors = Mons} = 
             Data
     end.
 
--doc "Answer every request with `Reason` and release the stream guard, ahead of the exit.".
+-doc """
+Answer every request with `Reason`, stop every upload process and
+release the stream guard, ahead of the exit.
+""".
 -spec fail_all_requests(#conn_data{}, term()) -> ok.
 fail_all_requests(#conn_data{self = Self, requests = Requests} = Data, Reason) ->
     maps:foreach(
         fun(_Ref, ReqSt) ->
-            send_response(ReqSt, {error, Reason}, Self)
+            ok = send_response(ReqSt, {error, Reason}, Self),
+            stop_feeder(ReqSt)
         end,
         Requests
     ),
@@ -2068,7 +2176,7 @@ send queue tracking runs on the result.
 reset_h2_stream(StreamId, #conn_data{h2_conn = H2Conn, socket = Socket} = Data) ->
     {ok, NewH2Conn, RstFrame} = nhttp_h2:send_rst_stream(H2Conn, StreamId, cancel),
     ok = rst_written(nhttp_sock:send(Socket, RstFrame)),
-    track_send_buffer(Data#conn_data{h2_conn = NewH2Conn}).
+    track_send_buffer(resume_uploads(Data#conn_data{h2_conn = NewH2Conn})).
 
 -doc """
 Rewrite the credit slot from the codec window while the connection is
@@ -2223,7 +2331,7 @@ close_response_stream(_ReqSt, _Data) ->
 ) -> #conn_data{}.
 end_stream_on_fin(fin, Ref, StreamId, ReqSt, Data) ->
     ok = last_stream_event(ReqSt, {done, normal}),
-    complete_request(Ref, StreamId, Data);
+    abandon_upload(ReqSt, StreamId, complete_request(Ref, StreamId, Data));
 end_stream_on_fin(nofin, Ref, _StreamId, ReqSt, Data) ->
     update_request(Ref, ReqSt, Data).
 
@@ -2247,8 +2355,10 @@ handle_stream_guard_down(_MRef, Data) ->
     Data.
 
 -spec guard_response_stream(pid(), #request_st{}) -> ok.
-guard_response_stream(Guard, #request_st{stream = #stream_st{handle = Handle}, stream_ref = Alias}) ->
-    nhttpc_stream_guard:opened(Guard, Handle, Alias);
+guard_response_stream(
+    Guard, #request_st{stream = #stream_st{handle = Handle}, stream_ref = Alias} = ReqSt
+) ->
+    nhttpc_stream_guard:opened(Guard, Handle, Alias, feeder(ReqSt));
 guard_response_stream(_Guard, #request_st{stream = undefined}) ->
     ok.
 
@@ -2335,6 +2445,233 @@ stream_mode(_Ref, _Opts, _Data) ->
 -spec stream_pool(stream_opts()) -> {pool, term()} | undefined.
 stream_pool(#{pool := PoolRef}) -> {pool, PoolRef};
 stream_pool(_StreamOpts) -> undefined.
+
+%%%-----------------------------------------------------------------------------
+%% REQUEST BODY FROM A SOURCE
+%%%-----------------------------------------------------------------------------
+-doc """
+Close the request side of a stream whose response ended while its body
+was not complete. RFC 9113 Section 8.1 lets a server answer before the
+end of the request. The stream is then half-closed, and the RST_STREAM
+tells the peer that no more of the body comes.
+""".
+-spec abandon_upload(#request_st{}, nhttp_lib:stream_id(), #conn_data{}) -> #conn_data{}.
+abandon_upload(#request_st{stream = #stream_st{upload = #upload_st{}}}, StreamId, Data) ->
+    reset_h2_stream(StreamId, Data);
+abandon_upload(_ReqSt, _StreamId, Data) ->
+    Data.
+
+-doc """
+Ask the upload process of a request for its next piece, when the request
+has one, holds no piece, and the codec holds no octet of its stream. A
+call in any other state asks for nothing, so one demand at most is out
+for a stream.
+""".
+-spec demand_upload(#request_st{}, #conn_data{}) -> ok.
+demand_upload(
+    #request_st{
+        stream = #stream_st{upload = #upload_st{feeder = Feeder, held = undefined}},
+        stream_ref = Ref,
+        stream_id = StreamId
+    },
+    #conn_data{h2_conn = H2Conn} = Data
+) ->
+    case nhttp_h2:send_buffer_bytes(H2Conn, StreamId) of
+        0 -> nhttpc_upload:demand(Feeder, Ref, upload_piece_size(Data));
+        _Queued -> ok
+    end;
+demand_upload(_ReqSt, _Data) ->
+    ok.
+
+-doc """
+End a request whose body failed: the owner gets the error and the peer
+gets RST_STREAM with CANCEL.
+""".
+-spec fail_upload(reference(), #request_st{}, {error, nhttpc_error:any_reason()}, #conn_data{}) ->
+    #conn_data{}.
+fail_upload(Ref, #request_st{stream_id = StreamId} = ReqSt, Error, #conn_data{self = Self} = Data) ->
+    ok = send_response(ReqSt, Error, Self),
+    reset_h2_stream(StreamId, complete_request(Ref, StreamId, Data)).
+
+-spec feeder(#request_st{}) -> pid() | undefined.
+feeder(#request_st{stream = #stream_st{upload = #upload_st{feeder = Feeder}}}) -> Feeder;
+feeder(_ReqSt) -> undefined.
+
+-doc """
+A monitor of this process fired for a request. The monitor of the upload
+process means that the source failed with no answer. Every other one is
+the monitor of the caller.
+""".
+-spec handle_monitor_down(reference(), reference(), term(), #conn_data{}) ->
+    #conn_data{} | no_return().
+handle_monitor_down(MRef, StreamRef, Reason, #conn_data{requests = Requests} = Data) ->
+    case Requests of
+        #{StreamRef := #request_st{stream = #stream_st{upload = #upload_st{mref = MRef}}} = ReqSt} ->
+            fail_upload(StreamRef, ReqSt, nhttp_error:upload_error(Reason), Data);
+        #{} ->
+            handle_caller_down(StreamRef, Data)
+    end.
+
+-spec handle_upload(reference(), nhttpc_upload:piece(), #conn_data{}) -> #conn_data{}.
+handle_upload(Ref, Piece, #conn_data{requests = Requests} = Data) ->
+    case Requests of
+        #{Ref := #request_st{stream = #stream_st{upload = #upload_st{held = undefined}}} = ReqSt} ->
+            take_upload(Piece, Ref, ReqSt, Data);
+        #{} ->
+            Data
+    end.
+
+-doc "Keep a piece that the send queue refused, for `resume_uploads/1`.".
+-spec hold_upload(reference(), #request_st{}, binary(), #conn_data{}) -> #conn_data{}.
+hold_upload(Ref, ReqSt, Chunk, #conn_data{held_uploads = Held} = Data) ->
+    Holding = set_held(ReqSt, Chunk),
+    update_request(Ref, Holding, Data#conn_data{held_uploads = Held ++ [Ref]}).
+
+-doc """
+Offer one piece of a request body to the codec and write what the
+windows take. The codec holds the rest, and the octets that left are
+taken from the credit slot, because no checkout reserved them. The next
+piece is asked for when nothing is held. A full send queue refuses the
+piece whole, and the piece waits in this process.
+""".
+-spec offer_upload(reference(), #request_st{}, binary(), nhttp_h2:fin(), #conn_data{}) ->
+    #conn_data{}.
+offer_upload(Ref, #request_st{stream_id = StreamId} = ReqSt, Chunk, Fin, Data) ->
+    case nhttp_h2:send_data(Data#conn_data.h2_conn, StreamId, Chunk, Fin) of
+        {ok, H2Conn, Frames} ->
+            offered_upload(Ref, ReqSt, byte_size(Chunk), Fin, Frames, H2Conn, Data);
+        {queued, H2Conn, Frames, Buffered} ->
+            offered_upload(Ref, ReqSt, byte_size(Chunk) - Buffered, Fin, Frames, H2Conn, Data);
+        {error, send_buffer_full} ->
+            hold_upload(Ref, ReqSt, Chunk, Data);
+        {error, Reason} ->
+            fail_upload(Ref, ReqSt, {error, {http2_error, Reason}}, Data)
+    end.
+
+-spec offered_upload(
+    reference(),
+    #request_st{},
+    non_neg_integer(),
+    nhttp_h2:fin(),
+    iodata(),
+    nhttp_h2:conn(),
+    #conn_data{}
+) -> #conn_data{}.
+offered_upload(Ref, ReqSt, Sent, Fin, Frames, H2Conn, Data) ->
+    ok = debit_send_credit(Sent, Data),
+    Data1 = write_upload(Frames, Data#conn_data{h2_conn = H2Conn}),
+    case Fin of
+        fin ->
+            end_upload(Ref, ReqSt, Data1);
+        nofin ->
+            ok = demand_upload(ReqSt, Data1),
+            Data1
+    end.
+
+-doc "The last piece of a body went to the codec. The upload process exits by itself.".
+-spec end_upload(reference(), #request_st{}, #conn_data{}) -> #conn_data{}.
+end_upload(
+    Ref,
+    #request_st{stream = #stream_st{upload = #upload_st{mref = MRef}} = Stream} = ReqSt,
+    #conn_data{caller_monitors = Mons} = Data
+) ->
+    erlang:demonitor(MRef, [flush]),
+    Done = ReqSt#request_st{stream = Stream#stream_st{upload = undefined}},
+    update_request(Ref, Done, Data#conn_data{caller_monitors = maps:remove(MRef, Mons)}).
+
+-spec open_upload(pid(), #request_st{}) -> #request_st{}.
+open_upload(Feeder, #request_st{stream = Stream} = ReqSt) ->
+    Upload = #upload_st{feeder = Feeder, mref = erlang:monitor(process, Feeder)},
+    ReqSt#request_st{stream = Stream#stream_st{upload = Upload}}.
+
+-doc """
+Offer again each piece that the send queue refused. The queue gets room
+when the codec drains it and when a stream is reset, and both paths end
+here. A piece that is refused again goes back on the list.
+""".
+-spec resume_uploads(#conn_data{}) -> #conn_data{}.
+resume_uploads(#conn_data{held_uploads = []} = Data) ->
+    Data;
+resume_uploads(#conn_data{held_uploads = Held} = Data) ->
+    lists:foldl(fun resume_upload/2, Data#conn_data{held_uploads = []}, Held).
+
+-spec resume_upload(reference(), #conn_data{}) -> #conn_data{}.
+resume_upload(Ref, #conn_data{requests = Requests} = Data) ->
+    case Requests of
+        #{Ref := #request_st{stream = #stream_st{upload = #upload_st{held = Chunk}}} = ReqSt} when
+            is_binary(Chunk)
+        ->
+            Offering = set_held(ReqSt, undefined),
+            offer_upload(Ref, Offering, Chunk, nofin, update_request(Ref, Offering, Data));
+        #{} ->
+            Data
+    end.
+
+-spec set_held(#request_st{}, binary() | undefined) -> #request_st{}.
+set_held(#request_st{stream = #stream_st{upload = Upload} = Stream} = ReqSt, Held) ->
+    ReqSt#request_st{stream = Stream#stream_st{upload = Upload#upload_st{held = Held}}}.
+
+-spec stop_feeder(#request_st{}) -> ok.
+stop_feeder(ReqSt) ->
+    case feeder(ReqSt) of
+        undefined -> ok;
+        Feeder -> nhttpc_upload:stop(Feeder)
+    end.
+
+-doc "Stop the upload process of a request that ends, and drop the monitor of it.".
+-spec stop_upload(#request_st{} | undefined, #conn_data{}) -> #conn_data{}.
+stop_upload(
+    #request_st{stream = #stream_st{upload = #upload_st{feeder = Feeder, mref = MRef}}},
+    #conn_data{caller_monitors = Mons} = Data
+) ->
+    erlang:demonitor(MRef, [flush]),
+    ok = nhttpc_upload:stop(Feeder),
+    Data#conn_data{caller_monitors = maps:remove(MRef, Mons)};
+stop_upload(_ReqSt, Data) ->
+    Data.
+
+-spec take_upload(nhttpc_upload:piece(), reference(), #request_st{}, #conn_data{}) ->
+    #conn_data{}.
+take_upload({data, Chunk}, Ref, ReqSt, Data) ->
+    offer_upload(Ref, ReqSt, Chunk, nofin, Data);
+take_upload(fin, Ref, ReqSt, Data) ->
+    offer_upload(Ref, ReqSt, <<>>, fin, Data);
+take_upload({error, Reason}, Ref, ReqSt, Data) ->
+    fail_upload(Ref, ReqSt, nhttp_error:upload_error(Reason), Data).
+
+-doc """
+The octets of one piece: one default frame, and never more than the send
+queue takes, so that a piece that waits there always fits an empty
+queue.
+""".
+-spec upload_piece_size(#conn_data{}) -> pos_integer().
+upload_piece_size(#conn_data{h2_settings = Settings}) ->
+    case maps:get(max_send_buffer, Settings, infinity) of
+        infinity -> ?UPLOAD_PIECE;
+        MaxSendBuffer -> min(MaxSendBuffer, ?UPLOAD_PIECE)
+    end.
+
+-doc "Add the monitor of the upload process to the monitors that name a request.".
+-spec watch_upload(#request_st{}, #conn_data{}) -> #conn_data{}.
+watch_upload(
+    #request_st{stream = #stream_st{upload = #upload_st{mref = MRef}}, stream_ref = Ref},
+    #conn_data{caller_monitors = Mons} = Data
+) ->
+    Data#conn_data{caller_monitors = Mons#{MRef => Ref}}.
+
+-doc "Write the frames of one piece. A write that fails ends the connection.".
+-spec write_upload(iodata(), #conn_data{}) -> #conn_data{}.
+write_upload([], Data) ->
+    Data;
+write_upload(Frames, #conn_data{socket = Socket} = Data) ->
+    case nhttp_sock:send(Socket, Frames) of
+        ok ->
+            track_send_buffer(Data);
+        {error, Reason} ->
+            {error, SendError} = nhttp_error:send_error(Reason),
+            fail_all_requests(Data, SendError),
+            exit({error, Reason})
+    end.
 
 %%%-----------------------------------------------------------------------------
 %% HTTP/1.1 HELPERS
